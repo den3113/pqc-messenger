@@ -1,0 +1,26 @@
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Байткод
+__pycache__/
+*.py[cod]
+
+# Переменные окружения (пароли, ключи API)
+.env
+
+# Настройки редакторов
+.vscode/
+.idea/
+
+# Яйца и дистрибутивы
+*.egg-info/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
