@@ -280,9 +280,15 @@ class IdentityKeyBundle:
         """Восстановить бандл из сериализованных данных."""
         try:
             x25519 = X25519KeyPair.from_private_bytes(data["x25519_private"])
+            # Определяем, реальный ли Kyber по размеру ключей и доступности liboqs.
+            # Эмуляция использует 32-байтовые X25519 ключи,
+            # реальный Kyber-768 — 1184-byte pub / 2400-byte priv.
+            kyber_pub = data["kyber_public"]
+            is_real = _HAS_LIBOQS and len(kyber_pub) > 32
             kyber = KyberKeyPair(
                 private_key=data["kyber_private"],
-                public_key=data["kyber_public"],
+                public_key=kyber_pub,
+                _is_real_kyber=is_real,
             )
             return cls(x25519=x25519, kyber=kyber)
         except Exception as e:
