@@ -143,6 +143,6 @@ class RelayMessage:
         return cls(type=MessageType.ACK, message_id=message_id)
 
     @classmethod
-    def error(cls, error_msg: str) -> RelayMessage:
+    def create_error(cls, error_msg: str) -> RelayMessage:
         """Создать сообщение ERROR."""
         return cls(type=MessageType.ERROR, error=error_msg)

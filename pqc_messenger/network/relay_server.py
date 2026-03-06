@@ -84,7 +84,7 @@ class RelayServer:
                 try:
                     msg = RelayMessage.from_json(raw_message)
                 except Exception as e:
-                    error_resp = RelayMessage.error(f"Ошибка формата: {e}")
+                    error_resp = RelayMessage.create_error(f"Ошибка формата: {e}")
                     await websocket.send(error_resp.to_json())
                     continue
 
