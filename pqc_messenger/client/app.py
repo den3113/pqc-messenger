@@ -51,6 +51,8 @@ class PQCMessengerApp:
         self._transport = Transport()
         self._identity: IdentityKeyBundle | None = None
         self._sessions: dict[str, Session] = {}  # contact_id → Session
+        self._pending_handshakes: dict[str, tuple[bytes, bytes, bytes]] = {}
+        # contact_id → (init_secret, contact_x25519_pub, contact_kyber_pub)
         self._master_key: bytes | None = None
         self._message_callback = None
 
@@ -180,15 +182,14 @@ class PQCMessengerApp:
         """Получить список контактов."""
         return self._db.get_all_contacts()
 
-    async def start_session(self, contact_id: str) -> Session:
+    async def start_session(self, contact_id: str) -> None:
         """
-        Начать сессию с контактом (выполнить Handshake).
+        Начать сессию с контактом (отправить Handshake INIT).
+
+        Сессия будет создана после получения HANDSHAKE_RESP.
 
         Args:
             contact_id: ID контакта.
-
-        Returns:
-            Установленная Session.
         """
         if not self.is_initialized:
             raise PQCError("Приложение не инициализировано")
@@ -219,24 +220,12 @@ class PQCMessengerApp:
         await self._transport.send_packet(packet)
         logger.info(f"HANDSHAKE_INIT отправлен контакту {contact_id[:16]}...")
 
-        # TODO: Ожидание HANDSHAKE_RESP в реальной реализации
-        # Для прототипа создаём сессию напрямую с init_secret
-
-        ratchet = SessionRatchet.initialize_as_initiator(
-            shared_secret=init_secret,
-            remote_dh_public=contact.x25519_public_key,
+        # Сохраняем состояние ожидания; сессия будет создана в _handle_handshake_resp
+        self._pending_handshakes[contact_id] = (
+            init_secret,
+            contact.x25519_public_key,
+            contact.kyber_public_key,
         )
-
-        session = Session.create(
-            contact_id=contact_id,
-            contact_x25519_pub=contact.x25519_public_key,
-            contact_kyber_pub=contact.kyber_public_key,
-            ratchet=ratchet,
-        )
-
-        self._sessions[contact_id] = session
-        logger.info(f"Сессия установлена: {session.session_id[:8]}")
-        return session
 
     async def send_message(self, contact_id: str, text: str) -> None:
         """
@@ -248,7 +237,22 @@ class PQCMessengerApp:
         """
         session = self._sessions.get(contact_id)
         if session is None:
-            session = await self.start_session(contact_id)
+            # Инициируем handshake, если ещё не начат
+            if contact_id not in self._pending_handshakes:
+                await self.start_session(contact_id)
+
+            # Ожидаем завершения handshake (до ~5 секунд)
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                session = self._sessions.get(contact_id)
+                if session is not None:
+                    break
+
+            if session is None:
+                raise SessionError(
+                    "Таймаут ожидания завершения Handshake. "
+                    "Убедитесь, что собеседник онлайн."
+                )
 
         # Шифруем и отправляем
         packet = session.send_message(text)
@@ -314,6 +318,8 @@ class PQCMessengerApp:
         """Обработать входящий пакет."""
         if packet.packet_type == PacketType.HANDSHAKE_INIT:
             await self._handle_handshake_init(packet)
+        elif packet.packet_type == PacketType.HANDSHAKE_RESP:
+            await self._handle_handshake_resp(packet)
         elif packet.packet_type == PacketType.MESSAGE:
             await self._handle_message(packet)
         else:
@@ -371,6 +377,63 @@ class PQCMessengerApp:
 
         except Exception as e:
             logger.error(f"Ошибка обработки HANDSHAKE_INIT: {e}")
+
+    async def _handle_handshake_resp(self, packet: Packet) -> None:
+        """Обработать входящий HANDSHAKE_RESP (сторона инициатора)."""
+        from pqc_messenger.protocol.handshake import HandshakeRespMessage
+
+        try:
+            resp_msg = HandshakeRespMessage.deserialize(packet.payload)
+
+            # Определяем contact_id по публичным ключам респондента
+            contact_id = Identity.compute_id(
+                resp_msg.responder_x25519_pub,
+                resp_msg.responder_kyber_pub,
+            )
+
+            # Ищем ожидающий handshake
+            pending = self._pending_handshakes.pop(contact_id, None)
+            if pending is None:
+                logger.warning(
+                    f"Получен HANDSHAKE_RESP для неизвестного handshake: "
+                    f"{contact_id[:16]}..."
+                )
+                return
+
+            init_secret, contact_x25519_pub, contact_kyber_pub = pending
+
+            # Завершаем handshake → получаем финальный секрет
+            final_secret = Handshake.complete_handshake(
+                initiator=self._identity,  # type: ignore[arg-type]
+                init_shared_secret=init_secret,
+                resp_msg=resp_msg,
+            )
+
+            # Создаём сессию с правильным финальным секретом
+            ratchet = SessionRatchet.initialize_as_initiator(
+                shared_secret=final_secret,
+                remote_dh_public=contact_x25519_pub,
+            )
+
+            session = Session.create(
+                contact_id=contact_id,
+                contact_x25519_pub=contact_x25519_pub,
+                contact_kyber_pub=contact_kyber_pub,
+                ratchet=ratchet,
+            )
+            self._sessions[contact_id] = session
+            self._persist_session(session)
+
+            logger.info(f"Handshake завершён с {contact_id[:16]}...")
+
+            # Уведомляем callback
+            if self._message_callback:
+                self._message_callback(
+                    "system", f"Сессия установлена с {contact_id[:16]}..."
+                )
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки HANDSHAKE_RESP: {e}")
 
     async def _handle_message(self, packet: Packet) -> None:
         """Обработать входящее сообщение."""
