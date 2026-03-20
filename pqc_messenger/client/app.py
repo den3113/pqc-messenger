@@ -439,30 +439,50 @@ class PQCMessengerApp:
 
     async def _handle_message(self, packet: Packet) -> None:
         """Обработать входящее сообщение."""
-        # Поиск сессии по recipient_hash → contact_id
+        # Первые 32 байта payload в формате ratchet — DH public key отправителя.
+        # Используем его для точного поиска сессии, не допуская
+        # «порчи» чужого ratchet при неудачной попытке расшифровки.
+        if len(packet.payload) < 36:
+            logger.warning("Слишком короткий payload MESSAGE пакета")
+            return
+
+        sender_dh_pub = packet.payload[:32]
+
+        # Сначала ищем по точному совпадению remote_dh_public или identity pub контакта
+        target_contact_id = None
         for contact_id, session in self._sessions.items():
-            try:
-                text = session.receive_message(packet)
+            r = session.ratchet
+            if (r.remote_dh_public == sender_dh_pub or
+                    session.contact_x25519_pub == sender_dh_pub):
+                target_contact_id = contact_id
+                break
 
-                # Сохраняем в БД
-                encrypted_for_storage = AEAD.encrypt(
-                    self._keystore._master_key,  # type: ignore[arg-type]
-                    text.encode("utf-8"),
-                )
-                self._db.store_message(contact_id, "received", encrypted_for_storage)
+        if target_contact_id is None:
+            logger.warning("Не удалось найти сессию для входящего сообщения")
+            return
 
-                self._persist_session(session)
+        session = self._sessions[target_contact_id]
+        try:
+            text = session.receive_message(packet)
 
-                logger.info(f"Сообщение получено от {contact_id[:16]}...")
+            # Сохраняем в БД
+            encrypted_for_storage = AEAD.encrypt(
+                self._keystore._master_key,  # type: ignore[arg-type]
+                text.encode("utf-8"),
+            )
+            self._db.store_message(target_contact_id, "received", encrypted_for_storage)
 
-                if self._message_callback:
-                    self._message_callback(contact_id, text)
+            self._persist_session(session)
 
-                return
-            except Exception:
-                continue
+            logger.info(f"Сообщение получено от {target_contact_id[:16]}...")
 
-        logger.warning("Не удалось расшифровать входящее сообщение")
+            if self._message_callback:
+                self._message_callback(target_contact_id, text)
+
+        except Exception as e:
+            logger.error(
+                f"Ошибка расшифрования сообщения от {target_contact_id[:16]}...: {e}"
+            )
 
     def _persist_session(self, session: Session) -> None:
         """Сохранить состояние сессии в хранилище."""

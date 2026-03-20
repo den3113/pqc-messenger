@@ -105,20 +105,42 @@ class Transport:
         reg_msg = RelayMessage.register(identity_hash)
         await self._ws.send(reg_msg.to_json())  # type: ignore[union-attr]
 
-        # Ждём ACK
+        # Ждём ACK — пропускаем DELIVER-пакеты, если они придут раньше подтверждения.
         try:
-            raw = await asyncio.wait_for(
-                self._ws.recv(),  # type: ignore[union-attr]
-                timeout=10.0,
-            )
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
+            deadline = asyncio.get_event_loop().time() + 10.0
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
 
-            response = RelayMessage.from_json(raw)
-            if response.type == MessageType.ERROR:
-                raise NetworkError(f"Relay отклонил регистрацию: {response.error}")
+                raw = await asyncio.wait_for(
+                    self._ws.recv(),  # type: ignore[union-attr]
+                    timeout=remaining,
+                )
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
 
-            logger.info(f"Зарегистрирован на relay как {identity_hash[:16]}...")
+                response = RelayMessage.from_json(raw)
+
+                if response.type == MessageType.ERROR:
+                    raise NetworkError(f"Relay отклонил регистрацию: {response.error}")
+
+                if response.type == MessageType.ACK:
+                    logger.info(f"Зарегистрирован на relay как {identity_hash[:16]}...")
+                    break
+
+                if response.type == MessageType.DELIVER:
+                    # Сообщение из mailbox пришло до ACK — ставим в очередь.
+                    try:
+                        packet_bytes = base64.b64decode(response.payload)
+                        from pqc_messenger.protocol.packet import Packet as _Packet
+                        packet = _Packet.deserialize(packet_bytes)
+                        await self._receive_queue.put(packet)
+                    except Exception as _e:
+                        logger.error(f"Ошибка разбора mailbox-пакета: {_e}")
+                    continue
+
+                logger.debug(f"Неожиданный тип при регистрации: {response.type}")
 
         except asyncio.TimeoutError:
             raise NetworkError("Таймаут при регистрации на relay")

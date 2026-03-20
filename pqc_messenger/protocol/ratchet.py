@@ -106,8 +106,9 @@ class SessionRatchet:
         """
         Инициализировать ratchet на стороне инициатора (после Handshake).
 
-        Начальный DH обмен использует identity-ключи обеих сторон,
-        чтобы инициатор и респондент получили одинаковый DH-выход.
+        Инициатор устанавливает sending chain на основе DH(own_identity, peer_identity).
+        DH keypair НЕ заменяется — identity pub будет отправлен в первом сообщении,
+        и респондент ожидает именно его.
 
         Args:
             shared_secret: Общий секрет из Handshake.
@@ -131,8 +132,9 @@ class SessionRatchet:
         ratchet.root_key = new_root_key
         ratchet.sending_chain = SymmetricRatchet(chain_key=chain_key)
 
-        # Генерируем новый эфемерный DH-ключ для следующих шагов ratchet
-        ratchet.dh_keypair = X25519KeyPair.generate()
+        # НЕ генерируем новый DH keypair — identity pub пойдёт в заголовке
+        # первого сообщения, и респондент ожидает именно его.
+        # Receiving chain будет создан при получении первого ответа (DH ratchet step).
 
         logger.info("Ratchet инициализирован (initiator)")
         return ratchet
@@ -146,6 +148,10 @@ class SessionRatchet:
     ) -> SessionRatchet:
         """
         Инициализировать ratchet на стороне респондента.
+
+        Респондент устанавливает только receiving chain на основе
+        DH(own_identity, peer_identity) — она совпадает с sending chain инициатора.
+        Sending chain будет создан при DH ratchet step (при отправке первого ответа).
 
         Args:
             shared_secret: Общий секрет из Handshake.
@@ -161,6 +167,7 @@ class SessionRatchet:
 
         # Устанавливаем receiving chain:
         # DH(own_dh, remote_dh) → receiving chain
+        # Это тот же DH output, что и у инициатора → цепочки совпадают.
         peer_pub = X25519KeyPair.public_from_bytes(remote_dh_public)
         dh_output = ratchet.dh_keypair.shared_secret(peer_pub)
         new_root_key, recv_chain_key = KDF.derive_pair(
@@ -170,15 +177,8 @@ class SessionRatchet:
         ratchet.root_key = new_root_key
         ratchet.receiving_chain = SymmetricRatchet(chain_key=recv_chain_key)
 
-        # Генерируем новую DH пару и устанавливаем sending chain
-        ratchet.dh_keypair = X25519KeyPair.generate()
-        dh_output2 = ratchet.dh_keypair.shared_secret(peer_pub)
-        new_root_key2, send_chain_key = KDF.derive_pair(
-            input_key=ratchet.root_key + dh_output2,
-            info=HKDF_INFO_RATCHET,
-        )
-        ratchet.root_key = new_root_key2
-        ratchet.sending_chain = SymmetricRatchet(chain_key=send_chain_key)
+        # НЕ создаём sending chain сразу — он будет создан при первой
+        # отправке через DH ratchet step (_perform_dh_ratchet).
 
         logger.info("Ratchet инициализирован (responder)")
         return ratchet
@@ -220,7 +220,23 @@ class SessionRatchet:
             Зашифрованные данные с метаинформацией для ratchet.
         """
         if self.sending_chain is None:
-            raise ProtocolError("Sending chain не инициализирован")
+            # Респондент ещё не отправлял сообщений —
+            # генерируем новый DH keypair и создаём sending chain.
+            # Новый DH pub пойдёт в заголовке сообщения, и получатель
+            # увидит новый ключ → выполнит DH ratchet → создаст receiving chain.
+            if self.remote_dh_public is not None and self.dh_keypair is not None:
+                self.dh_keypair = X25519KeyPair.generate()
+                peer_pub = X25519KeyPair.public_from_bytes(self.remote_dh_public)
+                dh_output = self.dh_keypair.shared_secret(peer_pub)
+                new_root_key, chain_key = KDF.derive_pair(
+                    input_key=self.root_key + dh_output,
+                    info=HKDF_INFO_RATCHET,
+                )
+                self.root_key = new_root_key
+                self.sending_chain = SymmetricRatchet(chain_key=chain_key)
+                self.send_count = 0
+            else:
+                raise ProtocolError("Sending chain не инициализирован")
         if self.dh_keypair is None:
             raise ProtocolError("DH keypair не инициализирован")
 
@@ -264,12 +280,15 @@ class SessionRatchet:
 
         # Проверяем, нужен ли DH ratchet step
         if self.remote_dh_public is None or remote_dh_pub != self.remote_dh_public:
-            # Новый DH ключ от собеседника → DH ratchet step
-            self._skip_message_keys(msg_count)
+            # Новый DH ключ от собеседника → DH ratchet step.
+            # Сначала кешируем пропущенные ключи в СТАРОЙ receiving chain (если есть),
+            # затем выполняем DH ratchet и сбрасываем счётчик.
+            if self.receiving_chain is not None:
+                self._skip_message_keys(msg_count)
             self._perform_dh_ratchet(remote_dh_pub)
             self.recv_count = 0
 
-        # Пропуск ключей, если есть пробелы в нумерации
+        # Пропуск ключей, если есть пробелы в нумерации (уже на новой цепочке)
         self._skip_message_keys(msg_count)
 
         # Получаем message key
@@ -358,6 +377,11 @@ class SessionRatchet:
 
     def serialize(self) -> bytes:
         """Сериализовать состояние ratchet для хранения."""
+        # Сериализуем skipped_keys: ключ — (dh_pub_hex, count), значение — key_hex
+        skipped = {
+            f"{dh_pub.hex()}:{count}": key.hex()
+            for (dh_pub, count), key in self.skipped_keys.items()
+        }
         state = {
             "root_key": self.root_key.hex(),
             "sending_chain": (
@@ -382,6 +406,7 @@ class SessionRatchet:
             ),
             "send_count": self.send_count,
             "recv_count": self.recv_count,
+            "skipped_keys": skipped,
         }
         return json.dumps(state).encode("utf-8")
 
@@ -409,5 +434,12 @@ class SessionRatchet:
 
         ratchet.send_count = state["send_count"]
         ratchet.recv_count = state["recv_count"]
+
+        # Восстанавливаем skipped_keys (ключ хранится как "dh_pub_hex:count")
+        for composite_key, key_hex in state.get("skipped_keys", {}).items():
+            dh_pub_hex, count_str = composite_key.rsplit(":", 1)
+            dh_pub = bytes.fromhex(dh_pub_hex)
+            count = int(count_str)
+            ratchet.skipped_keys[(dh_pub, count)] = bytes.fromhex(key_hex)
 
         return ratchet

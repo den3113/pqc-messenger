@@ -123,6 +123,12 @@ class RelayServer:
             f"(всего: {len(self.connections)})"
         )
 
+        # Подтверждение регистрации — ОБЯЗАТЕЛЬНО до mailbox,
+        # иначе клиент получит DELIVER раньше ACK и упадёт с ошибкой
+        # в transport.register() при ожидании подтверждения.
+        ack = RelayMessage.ack("register")
+        await websocket.send(ack.to_json())
+
         # Доставить накопленные сообщения из mailbox
         if sender_hash in self.mailboxes:
             mailbox = self.mailboxes[sender_hash]
@@ -138,9 +144,6 @@ class RelayServer:
             if delivered:
                 logger.info(f"Доставлено {delivered} накопленных сообщений для {sender_hash[:16]}...")
 
-        # Подтверждение регистрации
-        ack = RelayMessage.ack("register")
-        await websocket.send(ack.to_json())
         return sender_hash
 
     async def _handle_send(self, msg: RelayMessage) -> None:
