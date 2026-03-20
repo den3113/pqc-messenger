@@ -100,26 +100,39 @@ class SessionRatchet:
     def initialize_as_initiator(
         cls,
         shared_secret: bytes,
+        own_dh_keypair: X25519KeyPair,
         remote_dh_public: bytes,
     ) -> SessionRatchet:
         """
         Инициализировать ratchet на стороне инициатора (после Handshake).
 
+        Начальный DH обмен использует identity-ключи обеих сторон,
+        чтобы инициатор и респондент получили одинаковый DH-выход.
+
         Args:
             shared_secret: Общий секрет из Handshake.
-            remote_dh_public: DH публичный ключ респондента.
+            own_dh_keypair: Своя пара DH-ключей (identity X25519).
+            remote_dh_public: DH публичный ключ респондента (identity X25519).
 
         Returns:
             Инициализированный SessionRatchet.
         """
         ratchet = cls(root_key=shared_secret)
+        ratchet.dh_keypair = own_dh_keypair
         ratchet.remote_dh_public = remote_dh_public
 
-        # Генерация новой DH пары
-        ratchet.dh_keypair = X25519KeyPair.generate()
+        # Начальный DH: DH(own_identity, peer_identity) → sending chain
+        peer_pub = X25519KeyPair.public_from_bytes(remote_dh_public)
+        dh_output = ratchet.dh_keypair.shared_secret(peer_pub)
+        new_root_key, chain_key = KDF.derive_pair(
+            input_key=ratchet.root_key + dh_output,
+            info=HKDF_INFO_RATCHET,
+        )
+        ratchet.root_key = new_root_key
+        ratchet.sending_chain = SymmetricRatchet(chain_key=chain_key)
 
-        # DH ratchet step: вычисляем новый root_key и chain_key
-        ratchet._dh_ratchet_step()
+        # Генерируем новый эфемерный DH-ключ для следующих шагов ratchet
+        ratchet.dh_keypair = X25519KeyPair.generate()
 
         logger.info("Ratchet инициализирован (initiator)")
         return ratchet
@@ -129,6 +142,7 @@ class SessionRatchet:
         cls,
         shared_secret: bytes,
         own_dh_keypair: X25519KeyPair,
+        remote_dh_public: bytes,
     ) -> SessionRatchet:
         """
         Инициализировать ratchet на стороне респондента.
@@ -136,13 +150,36 @@ class SessionRatchet:
         Args:
             shared_secret: Общий секрет из Handshake.
             own_dh_keypair: Своя пара DH-ключей.
+            remote_dh_public: Публичный DH-ключ инициатора.
 
         Returns:
             Инициализированный SessionRatchet.
         """
         ratchet = cls(root_key=shared_secret)
         ratchet.dh_keypair = own_dh_keypair
-        # receiving_chain будет установлен при первом полученном сообщении
+        ratchet.remote_dh_public = remote_dh_public
+
+        # Устанавливаем receiving chain:
+        # DH(own_dh, remote_dh) → receiving chain
+        peer_pub = X25519KeyPair.public_from_bytes(remote_dh_public)
+        dh_output = ratchet.dh_keypair.shared_secret(peer_pub)
+        new_root_key, recv_chain_key = KDF.derive_pair(
+            input_key=ratchet.root_key + dh_output,
+            info=HKDF_INFO_RATCHET,
+        )
+        ratchet.root_key = new_root_key
+        ratchet.receiving_chain = SymmetricRatchet(chain_key=recv_chain_key)
+
+        # Генерируем новую DH пару и устанавливаем sending chain
+        ratchet.dh_keypair = X25519KeyPair.generate()
+        dh_output2 = ratchet.dh_keypair.shared_secret(peer_pub)
+        new_root_key2, send_chain_key = KDF.derive_pair(
+            input_key=ratchet.root_key + dh_output2,
+            info=HKDF_INFO_RATCHET,
+        )
+        ratchet.root_key = new_root_key2
+        ratchet.sending_chain = SymmetricRatchet(chain_key=send_chain_key)
+
         logger.info("Ratchet инициализирован (responder)")
         return ratchet
 

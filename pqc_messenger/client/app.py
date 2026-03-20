@@ -343,10 +343,11 @@ class PQCMessengerApp:
             )
 
             # Создаём сессию как респондент
-            from pqc_messenger.crypto.keys import X25519KeyPair
+            # Используем identity X25519 как начальный DH ключ (initiator знает его)
             ratchet = SessionRatchet.initialize_as_responder(
                 shared_secret=shared_secret,
-                own_dh_keypair=X25519KeyPair.generate(),
+                own_dh_keypair=self._identity.x25519,  # type: ignore[union-attr]
+                remote_dh_public=init_msg.initiator_x25519_pub,
             )
 
             session = Session.create(
@@ -412,6 +413,7 @@ class PQCMessengerApp:
             # Создаём сессию с правильным финальным секретом
             ratchet = SessionRatchet.initialize_as_initiator(
                 shared_secret=final_secret,
+                own_dh_keypair=self._identity.x25519,  # type: ignore[union-attr]
                 remote_dh_public=contact_x25519_pub,
             )
 
