@@ -167,9 +167,29 @@ class KyberKeyPair:
                 _is_real_kyber=False,
             )
 
+    # Размер реального Kyber-768 публичного ключа (FIPS 203)
+    KYBER768_PUB_SIZE = 1184
+    # Размер реального Kyber-768 шифротекста
+    KYBER768_CT_SIZE = 1088
+    # Размер эмулированного ключа / шифротекста (X25519)
+    EMULATED_SIZE = 32
+    # Null-секрет для случая несовместимости Kyber-режимов.
+    # Обе стороны используют этот секрет, когда Kyber-инкапсуляция
+    # невозможна (разные liboqs). Безопасность обеспечивается X25519-частью.
+    KYBER_NULL_SECRET = b"\x00" * 32
+
+    @staticmethod
+    def _is_real_kyber_data(data: bytes) -> bool:
+        """Определить, является ли ключ/шифротекст реальным Kyber-768."""
+        return len(data) > 32
+
     def encapsulate(self, peer_public: bytes) -> tuple[bytes, bytes]:
         """
         Инкапсуляция: создать общий секрет и шифротекст для получателя.
+
+        Автоматически определяет режим по размеру публичного ключа пира.
+        При несовместимости (нет liboqs, но пир использует реальный Kyber)
+        возвращает null-секрет — обе стороны получат одинаковый результат.
 
         Args:
             peer_public: Публичный ключ получателя.
@@ -177,25 +197,41 @@ class KyberKeyPair:
         Returns:
             (shared_secret, ciphertext) — общий секрет и шифротекст.
         """
-        if self._is_real_kyber:
+        peer_is_real = self._is_real_kyber_data(peer_public)
+
+        if _HAS_LIBOQS and peer_is_real:
+            # Оба устройства поддерживают реальный Kyber
             kem = oqs.KeyEncapsulation("Kyber768")
             ciphertext, shared_secret = kem.encap_secret(peer_public)
             return shared_secret, ciphertext
-        else:
-            # Эмуляция через X25519 ECDH
+
+        if not peer_is_real:
+            # Пир использует эмуляцию (32-байтовый X25519 ключ) —
+            # используем эмуляцию и мы, независимо от нашего liboqs
             ephemeral = X25519KeyPair.generate()
             peer_pub_key = X25519KeyPair.public_from_bytes(peer_public)
             raw_secret = ephemeral.shared_secret(peer_pub_key)
-            # shared_secret = SHA-256(raw_secret || context)
             shared_secret = hashlib.sha256(
                 raw_secret + b"kyber-768-emulation"
             ).digest()
-            ciphertext = ephemeral.serialize_public()  # 32 bytes ephemeral pub
+            ciphertext = ephemeral.serialize_public()  # 32 bytes
             return shared_secret, ciphertext
+
+        # peer_is_real=True, но _HAS_LIBOQS=False:
+        # Пир использует реальный Kyber, а у нас нет liboqs.
+        # Возвращаем null-секрет и пустой маркер-шифротекст.
+        logger.warning(
+            "Пир использует реальный Kyber, но liboqs недоступен. "
+            "Kyber-часть используется с null-секретом."
+        )
+        return self.KYBER_NULL_SECRET, b""
 
     def decapsulate(self, ciphertext: bytes) -> bytes:
         """
         Декапсуляция: извлечь общий секрет из шифротекста.
+
+        При несовместимости (получен реальный Kyber-шифротекст, но нет liboqs,
+        или наоборот) возвращает null-секрет для согласованного фоллбэка.
 
         Args:
             ciphertext: Полученный шифротекст от отправителя.
@@ -203,17 +239,38 @@ class KyberKeyPair:
         Returns:
             32 байта общего секрета.
         """
-        if self._is_real_kyber:
+        if len(ciphertext) == 0:
+            # Пустой шифротекст = маркер null-секрета от стороны без liboqs
+            logger.warning(
+                "Получен пустой Kyber шифротекст (пир без liboqs). "
+                "Используется null-секрет."
+            )
+            return self.KYBER_NULL_SECRET
+
+        ct_is_real = self._is_real_kyber_data(ciphertext)
+
+        if self._is_real_kyber and ct_is_real and _HAS_LIBOQS:
+            # Реальный Kyber шифротекст + реальный ключ
             kem = oqs.KeyEncapsulation("Kyber768", self.private_key)
             return kem.decap_secret(ciphertext)
-        else:
-            # Эмуляция: ciphertext — это ephemeral public key
+
+        if not ct_is_real and not self._is_real_kyber:
+            # Оба используют эмуляцию: ciphertext = ephemeral X25519 pub
             own_kp = X25519KeyPair.from_private_bytes(self.private_key)
             peer_ephemeral = X25519KeyPair.public_from_bytes(ciphertext)
             raw_secret = own_kp.shared_secret(peer_ephemeral)
             return hashlib.sha256(
                 raw_secret + b"kyber-768-emulation"
             ).digest()
+
+        # Несовместимость: один реальный, другой эмулированный
+        logger.warning(
+            f"Несовместимость Kyber-режимов "
+            f"(ciphertext={len(ciphertext)} байт, "
+            f"own_real={self._is_real_kyber}). "
+            "Используется null-секрет."
+        )
+        return self.KYBER_NULL_SECRET
 
 
 # ─── Identity Key Bundle ─────────────────────────────────────────────────────
