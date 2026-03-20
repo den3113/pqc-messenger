@@ -342,6 +342,26 @@ class PQCMessengerApp:
                 init_msg.initiator_kyber_pub,
             )
 
+            # Не перезаписываем уже установленную сессию с этим контактом.
+            # Повторный HANDSHAKE_INIT может прийти из mailbox после прямой доставки.
+            if contact_id in self._sessions:
+                logger.info(
+                    f"Сессия с {contact_id[:16]}... уже существует, "
+                    f"повторный HANDSHAKE_INIT проигнорирован"
+                )
+                # Всё равно отправляем RESP, чтобы инициатор завершил handshake
+                recipient_hash = Identity.compute_hash(
+                    init_msg.initiator_x25519_pub,
+                    init_msg.initiator_kyber_pub,
+                )
+                resp_packet = Packet(
+                    packet_type=PacketType.HANDSHAKE_RESP,
+                    recipient_hash=recipient_hash,
+                    payload=resp_msg.serialize(),
+                )
+                await self._transport.send_packet(resp_packet)
+                return
+
             # Создаём сессию как респондент
             # Используем identity X25519 как начальный DH ключ (initiator знает его)
             ratchet = SessionRatchet.initialize_as_responder(
@@ -417,14 +437,19 @@ class PQCMessengerApp:
                 remote_dh_public=contact_x25519_pub,
             )
 
-            session = Session.create(
-                contact_id=contact_id,
-                contact_x25519_pub=contact_x25519_pub,
-                contact_kyber_pub=contact_kyber_pub,
-                ratchet=ratchet,
-            )
-            self._sessions[contact_id] = session
-            self._persist_session(session)
+            # Не перезаписываем существующую сессию — повторный RESP
+            # может прийти если INIT был доставлен дважды (mailbox + прямой).
+            if contact_id not in self._sessions:
+                session = Session.create(
+                    contact_id=contact_id,
+                    contact_x25519_pub=contact_x25519_pub,
+                    contact_kyber_pub=contact_kyber_pub,
+                    ratchet=ratchet,
+                )
+                self._sessions[contact_id] = session
+                self._persist_session(session)
+            else:
+                session = self._sessions[contact_id]
 
             logger.info(f"Handshake завершён с {contact_id[:16]}...")
 
@@ -439,27 +464,55 @@ class PQCMessengerApp:
 
     async def _handle_message(self, packet: Packet) -> None:
         """Обработать входящее сообщение."""
-        # Первые 32 байта payload в формате ratchet — DH public key отправителя.
-        # Используем его для точного поиска сессии, не допуская
-        # «порчи» чужого ratchet при неудачной попытке расшифровки.
         if len(packet.payload) < 36:
             logger.warning("Слишком короткий payload MESSAGE пакета")
             return
 
+        # Relay доставляет пакет именно нам (по recipient_hash = наш identity hash),
+        # поэтому пакет точно предназначен этому клиенту. Нам нужно лишь найти,
+        # от какой именно сессии он пришёл.
+        #
+        # DH pub в заголовке ratchet-payload меняется при каждом DH ratchet step,
+        # поэтому сопоставлять по нему ненадёжно после первого обмена.
+        #
+        # Надёжная стратегия при небольшом числе сессий:
+        # пробуем каждую сессию, но только если расшифровка прошла успешно —
+        # AEAD с неверным ключом немедленно выбросит IntegrityError до
+        # любых изменений состояния (GCM tag проверяется до возврата plaintext).
+        # Единственный необратимый side-effect — продвижение receiving_chain.next()
+        # внутри decrypt(). Чтобы его избежать при неверной сессии, сначала
+        # проверяем «быстрые» фильтры, и только потом пробуем остальные.
+
         sender_dh_pub = packet.payload[:32]
 
-        # Сначала ищем по точному совпадению remote_dh_public или identity pub контакта
+        # Шаг 1: быстрый поиск по известным DH-ключам контакта.
+        # Совпадение гарантировано для первого сообщения и после каждого
+        # успешного _perform_dh_ratchet (remote_dh_public обновляется).
         target_contact_id = None
         for contact_id, session in self._sessions.items():
             r = session.ratchet
-            if (r.remote_dh_public == sender_dh_pub or
-                    session.contact_x25519_pub == sender_dh_pub):
+            if (r.remote_dh_public == sender_dh_pub
+                    or session.contact_x25519_pub == sender_dh_pub):
                 target_contact_id = contact_id
                 break
 
+        # Шаг 2: если быстрый поиск не дал результата (DH pub уже ротирован
+        # и ещё не обновлён в ratchet), пробуем все сессии по очереди.
+        # При одной активной сессии это всегда верный выбор.
+        # При нескольких — AEAD tag защитит от применения неверного ключа:
+        # IntegrityError будет выброшен до необратимого изменения состояния
+        # цепочки (receiving_chain.next() вызывается до AEAD.decrypt, поэтому
+        # при ошибке цепочка всё же продвинется). Для продакшена с ≥2 сессиями
+        # нужна явная привязка sender_id в пакете; пока ограничиваемся одной.
         if target_contact_id is None:
-            logger.warning("Не удалось найти сессию для входящего сообщения")
-            return
+            if len(self._sessions) == 1:
+                target_contact_id = next(iter(self._sessions))
+            else:
+                logger.warning(
+                    "Не удалось найти сессию для входящего сообщения "
+                    "(несколько активных сессий, DH pub не совпал ни с одной)"
+                )
+                return
 
         session = self._sessions[target_contact_id]
         try:
