@@ -42,6 +42,7 @@ HELP_TEXT = """\
   /contacts        Список контактов
   /chat <номер>    Начать диалог с контактом
   /history         Показать историю последнего чата
+  /delete <номер>  Удалить контакт и всю историю переписки
   /connect [url]   Подключиться к relay-серверу
   /wipe            Полное удаление всех данных
   /help            Эта справка
@@ -337,6 +338,9 @@ class CLI:
         parts = ["PQC-Messenger"]
         if self._app.is_initialized:
             parts.append(self._app.identity_id[:12] + "...")  # type: ignore
+            # Пункт 8: статус Kyber в строке состояния
+            kyber_label = "Kyber-768✓" if self._app.kyber_is_real else "Kyber-ЭМУЛ⚠"
+            parts.append(kyber_label)
         else:
             parts.append("не авторизован")
         if self._app.is_connected:
@@ -380,6 +384,7 @@ class CLI:
             "/contacts": self._cmd_contacts,
             "/chat":     self._cmd_chat,
             "/history":  self._cmd_history,
+            "/delete":   self._cmd_delete,
             "/connect":  self._cmd_connect,
             "/wipe":     self._cmd_wipe,
             "/help":     self._cmd_help,
@@ -414,6 +419,14 @@ class CLI:
         else:
             t.add_system("Хранилище разблокировано")
         t.add_info(f"Ваш ID: {Identity.format_fingerprint(self._app.identity_id)}")  # type: ignore
+        # Пункт 8: информируем о статусе Kyber
+        if self._app.kyber_is_real:
+            t.add_system("Kyber-768 (liboqs): постквантовая защита АКТИВНА")
+        else:
+            t.add_error(
+                "Kyber-768 работает в режиме ЭМУЛЯЦИИ (liboqs не установлен). "
+                "Постквантовая защита НЕ активна!"
+            )
         self._update_status()
 
     async def _cmd_myid(self, args: str) -> None:
@@ -482,6 +495,38 @@ class CLI:
                 self._update_status()
             else:
                 t.add_error(f"Нет контакта с номером {args}")
+        except ValueError:
+            t.add_error("Введите номер контакта")
+
+    async def _cmd_delete(self, args: str) -> None:
+        """Пункт 7: удалить контакт и все данные с ним."""
+        t = self._tui
+        assert t
+        if not self._app.is_initialized:
+            t.add_error("Сначала выполните /login"); return
+        contacts = self._app.get_contacts()
+        if not contacts:
+            t.add_error("Нет контактов"); return
+        if not args:
+            t.add_error("Использование: /delete <номер>")
+            await self._cmd_contacts(""); return
+        try:
+            idx = int(args) - 1
+            if not (0 <= idx < len(contacts)):
+                t.add_error(f"Нет контакта с номером {args}"); return
+            contact = contacts[idx]
+            name    = contact.display_name or contact.id[:8] + "..."
+            t.add_error(f"Удалить {name} и всю историю? Введите ДА:")
+            confirm = t.read_password("Подтверждение: ")
+            if confirm.strip() == "ДА":
+                # Выходим из чата если удаляем текущего собеседника
+                if self._chat_id == contact.id:
+                    self._chat_id = self._chat_name = ""
+                self._app.delete_contact(contact.id)
+                t.add_system(f"Контакт {name} удалён")
+                self._update_status()
+            else:
+                t.add_info("Отменено")
         except ValueError:
             t.add_error("Введите номер контакта")
 

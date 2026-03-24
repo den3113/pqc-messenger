@@ -1,10 +1,9 @@
 """
 SQLite база данных для хранения контактов, сообщений и сессий.
 
-Все текстовые данные сообщений хранятся в зашифрованном виде (AES-256-GCM).
-Ключи хранятся отдельно в KeyStore.
-
-Используется aiosqlite для асинхронного доступа.
+Пункт 3: автоматическое ограничение размера — при превышении
+DB_MAX_MESSAGES_PER_CONTACT или DB_MAX_TOTAL_MESSAGES старые
+сообщения удаляются, оставляя DB_PRUNE_KEEP последних.
 """
 
 from __future__ import annotations
@@ -13,53 +12,52 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
-from pqc_messenger.common.constants import DB_FILENAME, DEFAULT_DATA_DIR
+from pqc_messenger.common.constants import (
+    DB_FILENAME,
+    DB_MAX_MESSAGES_PER_CONTACT,
+    DB_MAX_TOTAL_MESSAGES,
+    DB_PRUNE_KEEP,
+    DEFAULT_DATA_DIR,
+)
 from pqc_messenger.common.exceptions import DatabaseError
 from pqc_messenger.common.logging import get_logger
 
 logger = get_logger("storage.database")
 
-# SQL-схема базы данных
 SCHEMA = """
--- Контакты
 CREATE TABLE IF NOT EXISTS contacts (
-    id TEXT PRIMARY KEY,                              -- SHA-256(x25519_pub || kyber_pub)
+    id TEXT PRIMARY KEY,
     display_name TEXT DEFAULT '',
     x25519_public_key BLOB NOT NULL,
     kyber_public_key BLOB NOT NULL,
     added_at REAL DEFAULT (strftime('%s', 'now'))
 );
 
--- Сообщения (контент зашифрован на мастер-ключе)
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
     direction TEXT NOT NULL CHECK(direction IN ('sent', 'received')),
-    encrypted_content BLOB NOT NULL,                  -- AES-256-GCM encrypted text
+    encrypted_content BLOB NOT NULL,
     timestamp REAL DEFAULT (strftime('%s', 'now'))
 );
 
--- Сессии (ratchet state зашифрован)
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-    ratchet_state BLOB NOT NULL,                      -- Зашифрованное состояние ratchet
+    ratchet_state BLOB NOT NULL,
     created_at REAL DEFAULT (strftime('%s', 'now')),
     last_activity REAL DEFAULT (strftime('%s', 'now'))
 );
 
--- Индексы для производительности
-CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id);
+CREATE INDEX IF NOT EXISTS idx_messages_contact   ON messages(contact_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
-CREATE INDEX IF NOT EXISTS idx_sessions_contact ON sessions(contact_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_contact   ON sessions(contact_id);
 """
 
 
 @dataclass
 class Contact:
-    """Модель контакта."""
     id: str
     display_name: str
     x25519_public_key: bytes
@@ -69,56 +67,44 @@ class Contact:
 
 @dataclass
 class Message:
-    """Модель сообщения (расшифрованного)."""
     id: int
     contact_id: str
-    direction: str  # 'sent' | 'received'
-    content: str    # Расшифрованный текст
+    direction: str
+    content: str
     timestamp: float
 
 
 class Database:
-    """
-    Менеджер SQLite базы данных.
-
-    Обеспечивает CRUD-операции для контактов, сообщений и сессий.
-    Все данные сообщений шифруются перед записью.
-    """
-
     def __init__(self, data_dir: str | None = None) -> None:
         if data_dir is None:
             data_dir = os.path.join(os.path.expanduser("~"), DEFAULT_DATA_DIR)
         self._data_dir = data_dir
-        self._db_path = os.path.join(data_dir, DB_FILENAME)
+        self._db_path  = os.path.join(data_dir, DB_FILENAME)
         self._conn: sqlite3.Connection | None = None
 
     def initialize(self) -> None:
-        """Инициализировать базу данных и создать таблицы."""
         os.makedirs(self._data_dir, exist_ok=True)
-
         try:
             self._conn = sqlite3.connect(self._db_path)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
             self._conn.commit()
-            logger.info(f"База данных инициализирована: {self._db_path}")
+            logger.info("База данных инициализирована: %s", self._db_path)
         except sqlite3.Error as e:
             raise DatabaseError(f"Ошибка инициализации БД: {e}") from e
 
     def close(self) -> None:
-        """Закрыть подключение к базе данных."""
         if self._conn:
             self._conn.close()
             self._conn = None
 
     def _ensure_connection(self) -> sqlite3.Connection:
-        """Убедиться, что подключение активно."""
         if self._conn is None:
             raise DatabaseError("База данных не инициализирована")
         return self._conn
 
-    # ── Контакты ──────────────────────────────────────────
+    # ── Контакты ──────────────────────────────────────────────────────────────
 
     def add_contact(
         self,
@@ -127,7 +113,6 @@ class Database:
         kyber_pub: bytes,
         display_name: str = "",
     ) -> Contact:
-        """Добавить новый контакт."""
         conn = self._ensure_connection()
         try:
             conn.execute(
@@ -136,7 +121,7 @@ class Database:
                 (contact_id, display_name, x25519_pub, kyber_pub),
             )
             conn.commit()
-            logger.info(f"Контакт добавлен: {contact_id[:16]}...")
+            logger.info("Контакт добавлен: %s...", contact_id[:16])
             return Contact(
                 id=contact_id,
                 display_name=display_name,
@@ -150,20 +135,15 @@ class Database:
             raise DatabaseError(f"Ошибка добавления контакта: {e}") from e
 
     def get_contact(self, contact_id: str) -> Contact | None:
-        """Получить контакт по ID."""
         conn = self._ensure_connection()
         row = conn.execute(
             "SELECT id, display_name, x25519_public_key, kyber_public_key, added_at "
             "FROM contacts WHERE id = ?",
             (contact_id,),
         ).fetchone()
-
-        if row is None:
-            return None
-        return Contact(*row)
+        return Contact(*row) if row else None
 
     def get_all_contacts(self) -> list[Contact]:
-        """Получить все контакты."""
         conn = self._ensure_connection()
         rows = conn.execute(
             "SELECT id, display_name, x25519_public_key, kyber_public_key, added_at "
@@ -172,13 +152,13 @@ class Database:
         return [Contact(*row) for row in rows]
 
     def delete_contact(self, contact_id: str) -> None:
-        """Удалить контакт и все связанные данные."""
+        """Пункт 7: удалить контакт и все связанные данные."""
         conn = self._ensure_connection()
         conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
         conn.commit()
-        logger.info(f"Контакт удалён: {contact_id[:16]}...")
+        logger.info("Контакт удалён: %s...", contact_id[:16])
 
-    # ── Сообщения ──────────────────────────────────────
+    # ── Сообщения ─────────────────────────────────────────────────────────────
 
     def store_message(
         self,
@@ -186,12 +166,6 @@ class Database:
         direction: str,
         encrypted_content: bytes,
     ) -> int:
-        """
-        Сохранить зашифрованное сообщение.
-
-        Returns:
-            ID сохранённого сообщения.
-        """
         conn = self._ensure_connection()
         try:
             cursor = conn.execute(
@@ -200,9 +174,61 @@ class Database:
                 (contact_id, direction, encrypted_content),
             )
             conn.commit()
-            return cursor.lastrowid or 0
+            msg_id = cursor.lastrowid or 0
+
+            # Пункт 3: проверяем лимиты и при необходимости чистим
+            self._prune_messages_if_needed(contact_id)
+
+            return msg_id
         except sqlite3.Error as e:
             raise DatabaseError(f"Ошибка сохранения сообщения: {e}") from e
+
+    def _prune_messages_if_needed(self, contact_id: str) -> None:
+        """
+        Пункт 3: Удалить старые сообщения если превышен лимит.
+
+        Проверяем два лимита:
+        - DB_MAX_MESSAGES_PER_CONTACT — на конкретный контакт
+        - DB_MAX_TOTAL_MESSAGES       — суммарно по всей БД
+        """
+        conn = self._ensure_connection()
+
+        # Лимит на контакт
+        (count_contact,) = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE contact_id = ?",
+            (contact_id,),
+        ).fetchone()
+
+        if count_contact > DB_MAX_MESSAGES_PER_CONTACT:
+            to_delete = count_contact - DB_PRUNE_KEEP
+            conn.execute(
+                "DELETE FROM messages WHERE contact_id = ? AND id IN ("
+                "  SELECT id FROM messages WHERE contact_id = ? "
+                "  ORDER BY timestamp ASC LIMIT ?"
+                ")",
+                (contact_id, contact_id, to_delete),
+            )
+            conn.commit()
+            logger.info(
+                "Очистка БД: удалено %d старых сообщений для %s...",
+                to_delete, contact_id[:16],
+            )
+
+        # Суммарный лимит
+        (count_total,) = conn.execute(
+            "SELECT COUNT(*) FROM messages"
+        ).fetchone()
+
+        if count_total > DB_MAX_TOTAL_MESSAGES:
+            to_delete = count_total - DB_PRUNE_KEEP
+            conn.execute(
+                "DELETE FROM messages WHERE id IN ("
+                "  SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?"
+                ")",
+                (to_delete,),
+            )
+            conn.commit()
+            logger.info("Очистка БД: удалено %d старых сообщений (суммарный лимит)", to_delete)
 
     def get_messages(
         self,
@@ -210,12 +236,6 @@ class Database:
         limit: int = 100,
         offset: int = 0,
     ) -> list[tuple[int, str, bytes, float]]:
-        """
-        Получить зашифрованные сообщения для контакта.
-
-        Returns:
-            Список кортежей (id, direction, encrypted_content, timestamp).
-        """
         conn = self._ensure_connection()
         rows = conn.execute(
             "SELECT id, direction, encrypted_content, timestamp "
@@ -225,17 +245,26 @@ class Database:
         ).fetchall()
         return rows
 
+    def count_messages(self, contact_id: str | None = None) -> int:
+        """Получить количество сообщений (для контакта или всего)."""
+        conn = self._ensure_connection()
+        if contact_id:
+            (n,) = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE contact_id = ?", (contact_id,)
+            ).fetchone()
+        else:
+            (n,) = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        return n
+
     def delete_messages(self, contact_id: str) -> int:
-        """Удалить все сообщения для контакта."""
         conn = self._ensure_connection()
         cursor = conn.execute(
-            "DELETE FROM messages WHERE contact_id = ?",
-            (contact_id,),
+            "DELETE FROM messages WHERE contact_id = ?", (contact_id,)
         )
         conn.commit()
         return cursor.rowcount
 
-    # ── Сессии ──────────────────────────────────────────
+    # ── Сессии ────────────────────────────────────────────────────────────────
 
     def store_session(
         self,
@@ -243,7 +272,6 @@ class Database:
         contact_id: str,
         ratchet_state: bytes,
     ) -> None:
-        """Сохранить или обновить сессию."""
         conn = self._ensure_connection()
         conn.execute(
             "INSERT OR REPLACE INTO sessions (id, contact_id, ratchet_state, last_activity) "
@@ -253,7 +281,6 @@ class Database:
         conn.commit()
 
     def get_session(self, contact_id: str) -> tuple[str, bytes] | None:
-        """Получить активную сессию для контакта."""
         conn = self._ensure_connection()
         row = conn.execute(
             "SELECT id, ratchet_state FROM sessions WHERE contact_id = ? "
@@ -262,21 +289,38 @@ class Database:
         ).fetchone()
         return row
 
+    def get_all_sessions(self) -> list[tuple[str, str, bytes, float]]:
+        """Получить все сессии: (session_id, contact_id, ratchet_state, last_activity)."""
+        conn = self._ensure_connection()
+        rows = conn.execute(
+            "SELECT id, contact_id, ratchet_state, last_activity FROM sessions"
+        ).fetchall()
+        return rows
+
     def delete_session(self, session_id: str) -> None:
-        """Удалить сессию."""
         conn = self._ensure_connection()
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         conn.commit()
 
-    # ── Очистка ──────────────────────────────────────
+    def delete_expired_sessions(self, ttl: float) -> int:
+        """
+        Пункт 4: удалить сессии старше ttl секунд.
+        Возвращает количество удалённых записей.
+        """
+        conn  = self._ensure_connection()
+        cutoff = time.time() - ttl
+        cursor = conn.execute(
+            "DELETE FROM sessions WHERE last_activity < ?", (cutoff,)
+        )
+        conn.commit()
+        n = cursor.rowcount
+        if n:
+            logger.info("Удалено %d истёкших сессий", n)
+        return n
+
+    # ── Очистка ───────────────────────────────────────────────────────────────
 
     def wipe_all(self) -> None:
-        """
-        Полное удаление всех данных.
-
-        ВНИМАНИЕ: Необратимая операция. Удаляет все контакты,
-        сообщения и сессии. Файл БД перезаписывается.
-        """
         conn = self._ensure_connection()
         conn.execute("DELETE FROM sessions")
         conn.execute("DELETE FROM messages")

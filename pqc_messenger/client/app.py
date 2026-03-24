@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
-from pathlib import Path
 
-from pqc_messenger.common.constants import DEFAULT_DATA_DIR, DEFAULT_RELAY_URL
+from pqc_messenger.common.constants import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_RELAY_URL,
+    SESSION_TTL,
+)
 from pqc_messenger.common.exceptions import (
     CryptoError,
     PQCError,
@@ -19,9 +21,8 @@ from pqc_messenger.common.exceptions import (
     StorageError,
 )
 from pqc_messenger.common.logging import get_logger
-from pqc_messenger.crypto.aead import AEAD
 from pqc_messenger.crypto.identity import Identity
-from pqc_messenger.crypto.keys import IdentityKeyBundle
+from pqc_messenger.crypto.keys import IdentityKeyBundle, _HAS_LIBOQS  # noqa: PLC2701
 from pqc_messenger.network.transport import Transport
 from pqc_messenger.protocol.handshake import Handshake
 from pqc_messenger.protocol.packet import Packet, PacketType
@@ -46,31 +47,30 @@ class PQCMessengerApp:
             data_dir = os.path.join(os.path.expanduser("~"), DEFAULT_DATA_DIR)
 
         self._data_dir = data_dir
-        self._db = Database(data_dir)
+        self._db       = Database(data_dir)
         self._keystore = KeyStore(data_dir)
         self._transport = Transport()
         self._identity: IdentityKeyBundle | None = None
-        self._sessions: dict[str, Session] = {}  # contact_id → Session
+        self._sessions: dict[str, Session] = {}
         self._pending_handshakes: dict[str, tuple[bytes, bytes, bytes]] = {}
-        # contact_id → (init_secret, contact_x25519_pub, contact_kyber_pub)
-        self._master_key: bytes | None = None
         self._message_callback = None
+        # Пункт 8: предупреждение о Kyber-эмуляции выводится один раз
+        self._kyber_warning_shown = False
+
+    # ── Свойства ──────────────────────────────────────────────────────────────
 
     @property
     def identity(self) -> IdentityKeyBundle | None:
-        """Текущая идентичность пользователя."""
         return self._identity
 
     @property
     def identity_id(self) -> str | None:
-        """ID текущей идентичности."""
         if self._identity:
             return self._identity.fingerprint()
         return None
 
     @property
     def identity_hash(self) -> str | None:
-        """Хеш идентичности для маршрутизации."""
         if self._identity:
             return Identity.compute_id(
                 self._identity.x25519.serialize_public(),
@@ -80,74 +80,137 @@ class PQCMessengerApp:
 
     @property
     def is_initialized(self) -> bool:
-        """Инициализировано ли приложение."""
         return self._identity is not None
 
     @property
     def is_connected(self) -> bool:
-        """Подключено ли приложение к relay."""
         return self._transport.is_connected
+
+    @property
+    def kyber_is_real(self) -> bool:
+        """True если используется настоящий Kyber-768 (liboqs), False = эмуляция."""
+        return bool(_HAS_LIBOQS)
+
+    # ── Инициализация ─────────────────────────────────────────────────────────
 
     def initialize(self, password: str) -> bool:
         """
         Инициализировать приложение.
 
-        Создаёт или разблокирует хранилище ключей,
-        загружает или генерирует идентичность.
-
-        Args:
-            password: Пароль пользователя.
-
         Returns:
-            True, если создана новая идентичность.
-        """
-        # Инициализируем базу данных
-        self._db.initialize()
+            True — создана новая идентичность.
 
-        # Инициализируем keystore
-        is_new = self._keystore.initialize(password)
+        Raises:
+            CryptoError: Неверный пароль.
+            StorageError: Повреждённое хранилище.
+        """
+        self._db.initialize()
+        is_new = self._keystore.initialize(password)  # raises CryptoError / StorageError
 
         if is_new:
-            # Генерируем новую идентичность
             self._identity = IdentityKeyBundle.generate()
             self._keystore.store_identity(self._identity)
             logger.info(
-                f"Новая идентичность создана: "
-                f"{Identity.format_fingerprint(self._identity.fingerprint())}"
+                "Новая идентичность создана: %s",
+                Identity.format_fingerprint(self._identity.fingerprint()),
             )
-            return True
         else:
-            # Загружаем существующую идентичность
             self._identity = self._keystore.load_identity()
             if self._identity is None:
-                # Хранилище существует, но идентичность отсутствует
                 self._identity = IdentityKeyBundle.generate()
                 self._keystore.store_identity(self._identity)
-                return True
+                is_new = True
+            else:
+                logger.info(
+                    "Идентичность загружена: %s",
+                    Identity.format_fingerprint(self._identity.fingerprint()),
+                )
+                # Восстанавливаем сохранённые сессии из БД
+                self._restore_sessions()
 
-            logger.info(
-                f"Идентичность загружена: "
-                f"{Identity.format_fingerprint(self._identity.fingerprint())}"
+        # Пункт 4: удаляем истёкшие сессии
+        expired = self._db.delete_expired_sessions(SESSION_TTL)
+        if expired:
+            logger.info("Удалено %d истёкших сессий при запуске", expired)
+
+        # Пункт 8: предупреждение об эмуляции Kyber
+        if not _HAS_LIBOQS and not self._kyber_warning_shown:
+            self._kyber_warning_shown = True
+            msg = (
+                "ВНИМАНИЕ: liboqs не найден — Kyber-768 работает в режиме ЭМУЛЯЦИИ "
+                "через X25519+HKDF. Постквантовая защита НЕ активна. "
+                "Для полной защиты установите liboqs-python."
             )
-            return False
+            logger.warning(msg)
+            if self._message_callback:
+                self._message_callback("system", "⚠ " + msg)
+
+        return is_new
+
+    def _restore_sessions(self) -> None:
+        """Восстановить активные сессии из БД при запуске."""
+        if not self._keystore.is_unlocked:
+            return
+        try:
+            rows = self._db.get_all_sessions()
+            for session_id, contact_id, ratchet_state_raw, last_activity in rows:
+                try:
+                    # ratchet_state в БД хранится незашифрованным (keystore хранит отдельно)
+                    # Пробуем загрузить из keystore (зашифровано)
+                    state_bytes = self._keystore.load_session_state(session_id)
+                    if state_bytes is None:
+                        # Fallback: используем данные из БД напрямую
+                        state_bytes = ratchet_state_raw
+
+                    ratchet = SessionRatchet.deserialize(state_bytes)
+                    contact = self._db.get_contact(contact_id)
+                    if contact is None:
+                        continue
+
+                    session = Session(
+                        session_id=session_id,
+                        contact_id=contact_id,
+                        contact_x25519_pub=contact.x25519_public_key,
+                        contact_kyber_pub=contact.kyber_public_key,
+                        ratchet=ratchet,
+                        last_activity=last_activity,
+                    )
+                    self._sessions[contact_id] = session
+                    logger.debug("Сессия восстановлена для %s...", contact_id[:16])
+                except Exception as e:
+                    logger.warning(
+                        "Не удалось восстановить сессию %s: %s", session_id[:8], e
+                    )
+            if self._sessions:
+                logger.info("Восстановлено %d сессий из хранилища", len(self._sessions))
+        except Exception as e:
+            logger.error("Ошибка восстановления сессий: %s", e)
+
+    # ── Подключение ───────────────────────────────────────────────────────────
 
     async def connect(self, relay_url: str = DEFAULT_RELAY_URL) -> None:
-        """
-        Подключиться к Relay Server.
-
-        Args:
-            relay_url: URL relay-сервера.
-        """
         if not self.is_initialized:
             raise PQCError("Приложение не инициализировано")
+
+        # Пункт 1: регистрируем callback переподключения
+        self._transport.set_reconnect_callback(self._on_reconnected)
 
         await self._transport.connect(relay_url)
         await self._transport.register(self.identity_hash)  # type: ignore[arg-type]
 
-        # Запускаем обработку входящих сообщений
         asyncio.create_task(self._process_incoming())
+        logger.info("Подключено к relay: %s", relay_url)
 
-        logger.info(f"Подключено к relay: {relay_url}")
+    async def _on_reconnected(self) -> None:
+        """
+        Пункт 1: вызывается транспортом после успешного переподключения.
+        Уведомляем пользователя.
+        """
+        logger.info("Переподключение к relay выполнено успешно")
+        if self._message_callback:
+            self._message_callback("system", "Связь с relay восстановлена")
+
+    # ── Контакты ──────────────────────────────────────────────────────────────
 
     def add_contact(
         self,
@@ -155,22 +218,9 @@ class PQCMessengerApp:
         kyber_pub_hex: str,
         display_name: str = "",
     ) -> Contact:
-        """
-        Добавить контакт по публичным ключам.
-
-        Args:
-            x25519_pub_hex: X25519 публичный ключ (hex).
-            kyber_pub_hex: Kyber публичный ключ (hex).
-            display_name: Отображаемое имя.
-
-        Returns:
-            Добавленный Contact.
-        """
         x25519_pub = bytes.fromhex(x25519_pub_hex)
-        kyber_pub = bytes.fromhex(kyber_pub_hex)
-
+        kyber_pub  = bytes.fromhex(kyber_pub_hex)
         contact_id = Identity.compute_id(x25519_pub, kyber_pub)
-
         return self._db.add_contact(
             contact_id=contact_id,
             x25519_pub=x25519_pub,
@@ -178,19 +228,24 @@ class PQCMessengerApp:
             display_name=display_name,
         )
 
+    def delete_contact(self, contact_id: str) -> None:
+        """
+        Пункт 7: удалить контакт, все сообщения и сессию с ним.
+        """
+        # Уничтожаем активную сессию если есть
+        session = self._sessions.pop(contact_id, None)
+        if session:
+            session.destroy()
+
+        self._db.delete_contact(contact_id)
+        logger.info("Контакт %s... удалён", contact_id[:16])
+
     def get_contacts(self) -> list[Contact]:
-        """Получить список контактов."""
         return self._db.get_all_contacts()
 
+    # ── Сессии ────────────────────────────────────────────────────────────────
+
     async def start_session(self, contact_id: str) -> None:
-        """
-        Начать сессию с контактом (отправить Handshake INIT).
-
-        Сессия будет создана после получения HANDSHAKE_RESP.
-
-        Args:
-            contact_id: ID контакта.
-        """
         if not self.is_initialized:
             raise PQCError("Приложение не инициализировано")
 
@@ -198,102 +253,71 @@ class PQCMessengerApp:
         if contact is None:
             raise SessionError(f"Контакт {contact_id[:16]}... не найден")
 
-        # Создаём HANDSHAKE_INIT
         init_msg, init_secret = Handshake.create_init(
             initiator=self._identity,  # type: ignore[arg-type]
             responder_x25519_pub=contact.x25519_public_key,
             responder_kyber_pub=contact.kyber_public_key,
         )
 
-        # Отправляем через relay
         recipient_hash = Identity.compute_hash(
             contact.x25519_public_key,
             contact.kyber_public_key,
         )
-
         packet = Packet(
             packet_type=PacketType.HANDSHAKE_INIT,
             recipient_hash=recipient_hash,
             payload=init_msg.serialize(),
         )
-
         await self._transport.send_packet(packet)
-        logger.info(f"HANDSHAKE_INIT отправлен контакту {contact_id[:16]}...")
+        logger.info("HANDSHAKE_INIT отправлен контакту %s...", contact_id[:16])
 
-        # Сохраняем состояние ожидания; сессия будет создана в _handle_handshake_resp
         self._pending_handshakes[contact_id] = (
             init_secret,
             contact.x25519_public_key,
             contact.kyber_public_key,
         )
 
-    async def send_message(self, contact_id: str, text: str) -> None:
-        """
-        Отправить сообщение контакту.
+    # ── Сообщения ─────────────────────────────────────────────────────────────
 
-        Args:
-            contact_id: ID контакта.
-            text: Текст сообщения.
-        """
+    async def send_message(self, contact_id: str, text: str) -> None:
         session = self._sessions.get(contact_id)
         if session is None:
-            # Инициируем handshake, если ещё не начат
             if contact_id not in self._pending_handshakes:
                 await self.start_session(contact_id)
-
-            # Ожидаем завершения handshake (до ~5 секунд)
             for _ in range(50):
                 await asyncio.sleep(0.1)
                 session = self._sessions.get(contact_id)
                 if session is not None:
                     break
-
             if session is None:
                 raise SessionError(
                     "Таймаут ожидания завершения Handshake. "
                     "Убедитесь, что собеседник онлайн."
                 )
 
-        # Шифруем и отправляем
         packet = session.send_message(text)
         await self._transport.send_packet(packet)
 
-        # Сохраняем в БД (зашифровано на мастер-ключе)
-        encrypted_for_storage = AEAD.encrypt(
-            self._keystore._master_key,  # type: ignore[arg-type]
-            text.encode("utf-8"),
+        # Пункт 6: используем encrypt_for_storage вместо _master_key напрямую
+        encrypted_for_storage = self._keystore.encrypt_for_storage(
+            text.encode("utf-8")
         )
         self._db.store_message(contact_id, "sent", encrypted_for_storage)
-
-        # Сохраняем состояние ratchet
         self._persist_session(session)
-
-        logger.info(f"Сообщение отправлено → {contact_id[:16]}...")
+        logger.info("Сообщение отправлено → %s...", contact_id[:16])
 
     def get_messages(self, contact_id: str, limit: int = 100) -> list[Message]:
-        """
-        Получить историю сообщений с контактом.
-
-        Args:
-            contact_id: ID контакта.
-            limit: Максимальное количество сообщений.
-
-        Returns:
-            Список расшифрованных Message.
-        """
-        if self._keystore._master_key is None:
+        if not self._keystore.is_unlocked:
             raise StorageError("Хранилище не разблокировано")
 
         raw_messages = self._db.get_messages(contact_id, limit)
         messages = []
-
         for msg_id, direction, encrypted_content, timestamp in raw_messages:
             try:
-                content = AEAD.decrypt(
-                    self._keystore._master_key,
-                    encrypted_content,
+                # Пункт 6: decrypt_from_storage вместо _master_key
+                content = self._keystore.decrypt_from_storage(
+                    encrypted_content
                 ).decode("utf-8")
-
                 messages.append(Message(
                     id=msg_id,
                     contact_id=contact_id,
@@ -302,20 +326,20 @@ class PQCMessengerApp:
                     timestamp=timestamp,
                 ))
             except Exception as e:
-                logger.error(f"Ошибка расшифрования сообщения {msg_id}: {e}")
+                logger.error("Ошибка расшифрования сообщения %d: %s", msg_id, e)
 
         return messages
 
+    # ── Обработка входящих ────────────────────────────────────────────────────
+
     async def _process_incoming(self) -> None:
-        """Фоновая обработка входящих пакетов."""
         try:
             async for packet in self._transport.receive_packets():
                 await self._handle_packet(packet)
         except Exception as e:
-            logger.error(f"Ошибка обработки входящих: {e}")
+            logger.error("Ошибка обработки входящих: %s", e)
 
     async def _handle_packet(self, packet: Packet) -> None:
-        """Обработать входящий пакет."""
         if packet.packet_type == PacketType.HANDSHAKE_INIT:
             await self._handle_handshake_init(packet)
         elif packet.packet_type == PacketType.HANDSHAKE_RESP:
@@ -323,53 +347,42 @@ class PQCMessengerApp:
         elif packet.packet_type == PacketType.MESSAGE:
             await self._handle_message(packet)
         else:
-            logger.warning(f"Неизвестный тип пакета: {packet.packet_type}")
+            logger.warning("Неизвестный тип пакета: %s", packet.packet_type)
 
     async def _handle_handshake_init(self, packet: Packet) -> None:
-        """Обработать входящий HANDSHAKE_INIT."""
         from pqc_messenger.protocol.handshake import HandshakeInitMessage
-
         try:
             init_msg = HandshakeInitMessage.deserialize(packet.payload)
             resp_msg, shared_secret = Handshake.process_init(
                 responder=self._identity,  # type: ignore[arg-type]
                 init_msg=init_msg,
             )
-
-            # Определяем contact_id
             contact_id = Identity.compute_id(
                 init_msg.initiator_x25519_pub,
                 init_msg.initiator_kyber_pub,
             )
 
-            # Не перезаписываем уже установленную сессию с этим контактом.
-            # Повторный HANDSHAKE_INIT может прийти из mailbox после прямой доставки.
             if contact_id in self._sessions:
                 logger.info(
-                    f"Сессия с {contact_id[:16]}... уже существует, "
-                    f"повторный HANDSHAKE_INIT проигнорирован"
+                    "Сессия с %s... уже существует, HANDSHAKE_INIT проигнорирован",
+                    contact_id[:16],
                 )
-                # Всё равно отправляем RESP, чтобы инициатор завершил handshake
                 recipient_hash = Identity.compute_hash(
                     init_msg.initiator_x25519_pub,
                     init_msg.initiator_kyber_pub,
                 )
-                resp_packet = Packet(
+                await self._transport.send_packet(Packet(
                     packet_type=PacketType.HANDSHAKE_RESP,
                     recipient_hash=recipient_hash,
                     payload=resp_msg.serialize(),
-                )
-                await self._transport.send_packet(resp_packet)
+                ))
                 return
 
-            # Создаём сессию как респондент
-            # Используем identity X25519 как начальный DH ключ (initiator знает его)
             ratchet = SessionRatchet.initialize_as_responder(
                 shared_secret=shared_secret,
                 own_dh_keypair=self._identity.x25519,  # type: ignore[union-attr]
                 remote_dh_public=init_msg.initiator_x25519_pub,
             )
-
             session = Session.create(
                 contact_id=contact_id,
                 contact_x25519_pub=init_msg.initiator_x25519_pub,
@@ -378,67 +391,49 @@ class PQCMessengerApp:
             )
             self._sessions[contact_id] = session
 
-            # Отправляем HANDSHAKE_RESP
             recipient_hash = Identity.compute_hash(
                 init_msg.initiator_x25519_pub,
                 init_msg.initiator_kyber_pub,
             )
-            resp_packet = Packet(
+            await self._transport.send_packet(Packet(
                 packet_type=PacketType.HANDSHAKE_RESP,
                 recipient_hash=recipient_hash,
                 payload=resp_msg.serialize(),
-            )
-            await self._transport.send_packet(resp_packet)
-
-            logger.info(f"Handshake принят от {contact_id[:16]}...")
-
-            # Уведомляем callback
+            ))
+            logger.info("Handshake принят от %s...", contact_id[:16])
             if self._message_callback:
                 self._message_callback("system", f"Новая сессия с {contact_id[:16]}...")
 
         except Exception as e:
-            logger.error(f"Ошибка обработки HANDSHAKE_INIT: {e}")
+            logger.error("Ошибка обработки HANDSHAKE_INIT: %s", e)
 
     async def _handle_handshake_resp(self, packet: Packet) -> None:
-        """Обработать входящий HANDSHAKE_RESP (сторона инициатора)."""
         from pqc_messenger.protocol.handshake import HandshakeRespMessage
-
         try:
-            resp_msg = HandshakeRespMessage.deserialize(packet.payload)
-
-            # Определяем contact_id по публичным ключам респондента
+            resp_msg   = HandshakeRespMessage.deserialize(packet.payload)
             contact_id = Identity.compute_id(
                 resp_msg.responder_x25519_pub,
                 resp_msg.responder_kyber_pub,
             )
-
-            # Ищем ожидающий handshake
             pending = self._pending_handshakes.pop(contact_id, None)
             if pending is None:
                 logger.warning(
-                    f"Получен HANDSHAKE_RESP для неизвестного handshake: "
-                    f"{contact_id[:16]}..."
+                    "Получен HANDSHAKE_RESP для неизвестного handshake: %s...",
+                    contact_id[:16],
                 )
                 return
 
             init_secret, contact_x25519_pub, contact_kyber_pub = pending
-
-            # Завершаем handshake → получаем финальный секрет
             final_secret = Handshake.complete_handshake(
                 initiator=self._identity,  # type: ignore[arg-type]
                 init_shared_secret=init_secret,
                 resp_msg=resp_msg,
             )
-
-            # Создаём сессию с правильным финальным секретом
             ratchet = SessionRatchet.initialize_as_initiator(
                 shared_secret=final_secret,
                 own_dh_keypair=self._identity.x25519,  # type: ignore[union-attr]
                 remote_dh_public=contact_x25519_pub,
             )
-
-            # Не перезаписываем существующую сессию — повторный RESP
-            # может прийти если INIT был доставлен дважды (mailbox + прямой).
             if contact_id not in self._sessions:
                 session = Session.create(
                     contact_id=contact_id,
@@ -448,47 +443,22 @@ class PQCMessengerApp:
                 )
                 self._sessions[contact_id] = session
                 self._persist_session(session)
-            else:
-                session = self._sessions[contact_id]
 
-            logger.info(f"Handshake завершён с {contact_id[:16]}...")
-
-            # Уведомляем callback
+            logger.info("Handshake завершён с %s...", contact_id[:16])
             if self._message_callback:
-                self._message_callback(
-                    "system", f"Сессия установлена с {contact_id[:16]}..."
-                )
+                self._message_callback("system", f"Сессия установлена с {contact_id[:16]}...")
 
         except Exception as e:
-            logger.error(f"Ошибка обработки HANDSHAKE_RESP: {e}")
+            logger.error("Ошибка обработки HANDSHAKE_RESP: %s", e)
 
     async def _handle_message(self, packet: Packet) -> None:
-        """Обработать входящее сообщение."""
         if len(packet.payload) < 36:
             logger.warning("Слишком короткий payload MESSAGE пакета")
             return
 
-        # Relay доставляет пакет именно нам (по recipient_hash = наш identity hash),
-        # поэтому пакет точно предназначен этому клиенту. Нам нужно лишь найти,
-        # от какой именно сессии он пришёл.
-        #
-        # DH pub в заголовке ratchet-payload меняется при каждом DH ratchet step,
-        # поэтому сопоставлять по нему ненадёжно после первого обмена.
-        #
-        # Надёжная стратегия при небольшом числе сессий:
-        # пробуем каждую сессию, но только если расшифровка прошла успешно —
-        # AEAD с неверным ключом немедленно выбросит IntegrityError до
-        # любых изменений состояния (GCM tag проверяется до возврата plaintext).
-        # Единственный необратимый side-effect — продвижение receiving_chain.next()
-        # внутри decrypt(). Чтобы его избежать при неверной сессии, сначала
-        # проверяем «быстрые» фильтры, и только потом пробуем остальные.
-
-        sender_dh_pub = packet.payload[:32]
-
-        # Шаг 1: быстрый поиск по известным DH-ключам контакта.
-        # Совпадение гарантировано для первого сообщения и после каждого
-        # успешного _perform_dh_ratchet (remote_dh_public обновляется).
+        sender_dh_pub     = packet.payload[:32]
         target_contact_id = None
+
         for contact_id, session in self._sessions.items():
             r = session.ratchet
             if (r.remote_dh_public == sender_dh_pub
@@ -496,14 +466,6 @@ class PQCMessengerApp:
                 target_contact_id = contact_id
                 break
 
-        # Шаг 2: если быстрый поиск не дал результата (DH pub уже ротирован
-        # и ещё не обновлён в ratchet), пробуем все сессии по очереди.
-        # При одной активной сессии это всегда верный выбор.
-        # При нескольких — AEAD tag защитит от применения неверного ключа:
-        # IntegrityError будет выброшен до необратимого изменения состояния
-        # цепочки (receiving_chain.next() вызывается до AEAD.decrypt, поэтому
-        # при ошибке цепочка всё же продвинется). Для продакшена с ≥2 сессиями
-        # нужна явная привязка sender_id в пакете; пока ограничиваемся одной.
         if target_contact_id is None:
             if len(self._sessions) == 1:
                 target_contact_id = next(iter(self._sessions))
@@ -518,27 +480,24 @@ class PQCMessengerApp:
         try:
             text = session.receive_message(packet)
 
-            # Сохраняем в БД
-            encrypted_for_storage = AEAD.encrypt(
-                self._keystore._master_key,  # type: ignore[arg-type]
-                text.encode("utf-8"),
+            # Пункт 6: encrypt_for_storage вместо _master_key
+            encrypted_for_storage = self._keystore.encrypt_for_storage(
+                text.encode("utf-8")
             )
             self._db.store_message(target_contact_id, "received", encrypted_for_storage)
-
             self._persist_session(session)
-
-            logger.info(f"Сообщение получено от {target_contact_id[:16]}...")
+            logger.info("Сообщение получено от %s...", target_contact_id[:16])
 
             if self._message_callback:
                 self._message_callback(target_contact_id, text)
 
         except Exception as e:
             logger.error(
-                f"Ошибка расшифрования сообщения от {target_contact_id[:16]}...: {e}"
+                "Ошибка расшифрования сообщения от %s...: %s",
+                target_contact_id[:16], e,
             )
 
     def _persist_session(self, session: Session) -> None:
-        """Сохранить состояние сессии в хранилище."""
         try:
             ratchet_state = session.ratchet.serialize()
             self._keystore.store_session_state(session.session_id, ratchet_state)
@@ -548,39 +507,29 @@ class PQCMessengerApp:
                 ratchet_state,
             )
         except Exception as e:
-            logger.error(f"Ошибка сохранения сессии: {e}")
+            logger.error("Ошибка сохранения сессии: %s", e)
 
     def set_message_callback(self, callback) -> None:
-        """Установить callback для обработки входящих сообщений."""
         self._message_callback = callback
 
-    async def wipe_all(self) -> None:
-        """
-        Полное удаление всех данных.
+    # ── Очистка ───────────────────────────────────────────────────────────────
 
-        Удаляет: ключи, сообщения, контакты, сессии.
-        """
-        # Уничтожаем активные сессии
+    async def wipe_all(self) -> None:
         for session in self._sessions.values():
             session.destroy()
         self._sessions.clear()
-
-        # Отключаемся от relay
         if self._transport.is_connected:
             await self._transport.disconnect()
-
-        # Очищаем хранилища
         self._db.wipe_all()
         self._keystore.wipe()
         self._identity = None
-
         logger.warning("Все данные полностью уничтожены (WIPE)")
 
     def shutdown(self) -> None:
-        """Корректное завершение работы."""
+        # Пункт 4: удаляем истёкшие сессии при завершении
+        self._db.delete_expired_sessions(SESSION_TTL)
         for session in self._sessions.values():
             self._persist_session(session)
-
         self._db.close()
         self._keystore.close()
         logger.info("Приложение завершено")

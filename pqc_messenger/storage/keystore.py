@@ -1,12 +1,8 @@
 """
 Зашифрованное хранилище ключей.
 
-Приватные ключи идентичности хранятся зашифрованными на мастер-ключе,
-который деривируется из пароля пользователя через Argon2id.
-
-Структура файла keystore:
-- salt (16 bytes): Соль для Argon2id
-- encrypted_bundle: AES-256-GCM(master_key, serialized IdentityKeyBundle)
+Пункт 6: мастер-ключ больше не доступен напрямую снаружи.
+Вместо _master_key используется метод encrypt_for_storage() / decrypt_from_storage().
 """
 
 from __future__ import annotations
@@ -14,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from pathlib import Path
 
 from pqc_messenger.common.constants import DEFAULT_DATA_DIR, KEYSTORE_FILENAME
 from pqc_messenger.common.exceptions import CryptoError, StorageError
@@ -30,188 +25,173 @@ class KeyStore:
     """
     Зашифрованное хранилище приватных ключей.
 
-    Все ключи шифруются мастер-ключом, который деривируется
-    из пароля пользователя через Argon2id (RFC 9106).
-
-    Использование:
-        ks = KeyStore(data_dir="/path/to/data")
-        ks.initialize("user_password")
-        ks.store_identity(bundle)
-        bundle = ks.load_identity()
+    Публичный API не раскрывает мастер-ключ напрямую.
+    Для шифрования/расшифровки данных приложения используйте
+    encrypt_for_storage() и decrypt_from_storage().
     """
 
     def __init__(self, data_dir: str | None = None) -> None:
         if data_dir is None:
             data_dir = os.path.join(os.path.expanduser("~"), DEFAULT_DATA_DIR)
-        self._data_dir = data_dir
-        self._ks_path = os.path.join(data_dir, KEYSTORE_FILENAME)
-        self._master_key: bytes | None = None
+        self._data_dir  = data_dir
+        self._ks_path   = os.path.join(data_dir, KEYSTORE_FILENAME)
+        self.__master_key: bytes | None = None   # двойное подчёркивание = name mangling
         self._conn: sqlite3.Connection | None = None
+
+    # ── Инициализация ─────────────────────────────────────────────────────────
 
     def initialize(self, password: str) -> bool:
         """
-        Инициализировать хранилище ключей.
-
-        Если хранилище уже существует, проверяет пароль.
-        Если нет — создаёт новое.
-
-        Args:
-            password: Пароль пользователя.
+        Инициализировать хранилище.
 
         Returns:
-            True, если хранилище создано заново.
-            False, если хранилище уже существовало.
+            True — создано новое хранилище.
+            False — существующее разблокировано.
 
         Raises:
-            CryptoError: При неверном пароле.
+            CryptoError: Неверный пароль.
+            StorageError: Повреждённое хранилище.
         """
         os.makedirs(self._data_dir, exist_ok=True)
-
         is_new = not os.path.exists(self._ks_path)
 
         self._conn = sqlite3.connect(self._ks_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS keystore (
-                key TEXT PRIMARY KEY,
+                key   TEXT PRIMARY KEY,
                 value BLOB NOT NULL
             );
         """)
         self._conn.commit()
 
         if is_new:
-            # Создаём новое хранилище
             master_key, salt = PasswordKDF.derive(password)
-            self._master_key = master_key
-
-            # Сохраняем соль и контрольную запись
+            self.__master_key = master_key
             self._put("argon2_salt", salt)
-            verification = AEAD.encrypt(master_key, b"PQC_KEYSTORE_OK")
-            self._put("verification", verification)
+            self._put("verification", AEAD.encrypt(master_key, b"PQC_KEYSTORE_OK"))
             self._conn.commit()
-
             logger.info("Новое хранилище ключей создано")
             return True
-        else:
-            # Проверяем пароль
-            salt = self._get("argon2_salt")
-            if salt is None:
-                raise StorageError("Повреждённое хранилище: отсутствует соль")
 
-            master_key, _ = PasswordKDF.derive(password, salt)
+        # Разблокировка существующего
+        salt = self._get("argon2_salt")
+        if salt is None:
+            raise StorageError("Повреждённое хранилище: отсутствует соль")
 
-            verification = self._get("verification")
-            if verification is None:
-                raise StorageError("Повреждённое хранилище: отсутствует контрольная запись")
+        master_key, _ = PasswordKDF.derive(password, salt)
 
-            try:
-                result = AEAD.decrypt(master_key, verification)
-                if result != b"PQC_KEYSTORE_OK":
-                    raise CryptoError("Неверный пароль")
-            except Exception:
-                raise CryptoError(
-                    "Неверный пароль. Невозможно разблокировать хранилище ключей."
-                )
+        verification = self._get("verification")
+        if verification is None:
+            raise StorageError("Повреждённое хранилище: отсутствует контрольная запись")
 
-            self._master_key = master_key
-            logger.info("Хранилище ключей разблокировано")
-            return False
+        # Пункт 2: явно различаем неверный пароль и повреждённые данные
+        try:
+            result = AEAD.decrypt(master_key, verification)
+        except Exception:
+            raise CryptoError(
+                "Неверный пароль. Проверьте правильность ввода."
+            )
+
+        if result != b"PQC_KEYSTORE_OK":
+            raise StorageError(
+                "Хранилище повреждено: контрольная запись не совпадает. "
+                "Возможно, файл был изменён вручную."
+            )
+
+        self.__master_key = master_key
+        logger.info("Хранилище ключей разблокировано")
+        return False
+
+    @property
+    def is_unlocked(self) -> bool:
+        """Проверить, разблокировано ли хранилище."""
+        return self.__master_key is not None
+
+    # ── Публичный API шифрования (пункт 6) ───────────────────────────────────
+
+    def encrypt_for_storage(self, plaintext: bytes) -> bytes:
+        """
+        Зашифровать данные на мастер-ключе.
+
+        Использовать вместо прямого доступа к _master_key.
+        """
+        if self.__master_key is None:
+            raise StorageError("Хранилище не разблокировано")
+        return AEAD.encrypt(self.__master_key, plaintext)
+
+    def decrypt_from_storage(self, ciphertext: bytes) -> bytes:
+        """
+        Расшифровать данные зашифрованные на мастер-ключе.
+
+        Использовать вместо прямого доступа к _master_key.
+        """
+        if self.__master_key is None:
+            raise StorageError("Хранилище не разблокировано")
+        return AEAD.decrypt(self.__master_key, ciphertext)
+
+    # ── Identity ─────────────────────────────────────────────────────────────
 
     def store_identity(self, bundle: IdentityKeyBundle) -> None:
-        """
-        Сохранить набор ключей идентичности (зашифрованно).
-
-        Args:
-            bundle: IdentityKeyBundle для сохранения.
-        """
-        if self._master_key is None:
+        if self.__master_key is None:
             raise StorageError("Хранилище не инициализировано")
-
         serialized = bundle.serialize()
-        # Конвертируем bytes-значения в hex для JSON-сериализации
-        json_data = {k: v.hex() for k, v in serialized.items()}
-        plaintext = json.dumps(json_data).encode("utf-8")
-
-        encrypted = AEAD.encrypt(self._master_key, plaintext)
-        self._put("identity_bundle", encrypted)
+        json_data  = {k: v.hex() for k, v in serialized.items()}
+        plaintext  = json.dumps(json_data).encode("utf-8")
+        self._put("identity_bundle", AEAD.encrypt(self.__master_key, plaintext))
         self._conn.commit()  # type: ignore[union-attr]
-
-        logger.info(f"Identity сохранён: {bundle.fingerprint()[:16]}...")
+        logger.info("Identity сохранён: %s...", bundle.fingerprint()[:16])
 
     def load_identity(self) -> IdentityKeyBundle | None:
-        """
-        Загрузить набор ключей идентичности.
-
-        Returns:
-            IdentityKeyBundle или None, если ещё не создан.
-        """
-        if self._master_key is None:
+        if self.__master_key is None:
             raise StorageError("Хранилище не инициализировано")
-
         encrypted = self._get("identity_bundle")
         if encrypted is None:
             return None
-
         try:
-            plaintext = AEAD.decrypt(self._master_key, encrypted)
-            json_data = json.loads(plaintext)
-            # Конвертируем hex обратно в bytes
+            plaintext  = AEAD.decrypt(self.__master_key, encrypted)
+            json_data  = json.loads(plaintext)
             serialized = {k: bytes.fromhex(v) for k, v in json_data.items()}
             return IdentityKeyBundle.deserialize(serialized)
         except Exception as e:
             raise StorageError(f"Ошибка загрузки identity: {e}") from e
 
-    def store_session_state(
-        self,
-        session_id: str,
-        state: bytes,
-    ) -> None:
-        """Сохранить зашифрованное состояние сессии."""
-        if self._master_key is None:
-            raise StorageError("Хранилище не инициализировано")
+    # ── Session state ─────────────────────────────────────────────────────────
 
-        encrypted = AEAD.encrypt(self._master_key, state)
-        self._put(f"session:{session_id}", encrypted)
+    def store_session_state(self, session_id: str, state: bytes) -> None:
+        if self.__master_key is None:
+            raise StorageError("Хранилище не инициализировано")
+        self._put(f"session:{session_id}", AEAD.encrypt(self.__master_key, state))
         self._conn.commit()  # type: ignore[union-attr]
 
     def load_session_state(self, session_id: str) -> bytes | None:
-        """Загрузить состояние сессии."""
-        if self._master_key is None:
+        if self.__master_key is None:
             raise StorageError("Хранилище не инициализировано")
-
         encrypted = self._get(f"session:{session_id}")
         if encrypted is None:
             return None
+        return AEAD.decrypt(self.__master_key, encrypted)
 
-        return AEAD.decrypt(self._master_key, encrypted)
+    # ── Служебное ────────────────────────────────────────────────────────────
 
     def wipe(self) -> None:
-        """
-        Полное удаление всех ключей.
-
-        ВНИМАНИЕ: Необратимая операция.
-        """
         if self._conn:
             self._conn.execute("DELETE FROM keystore")
             self._conn.execute("VACUUM")
             self._conn.commit()
-
-        self._master_key = None
+        self.__master_key = None
         logger.warning("Все ключи удалены (WIPE)")
 
     def close(self) -> None:
-        """Закрыть хранилище и обнулить мастер-ключ."""
-        if self._master_key:
-            # Пытаемся обнулить мастер-ключ (ограничения Python)
-            self._master_key = b"\x00" * len(self._master_key)
-            self._master_key = None
-
+        if self.__master_key:
+            # Обнуляем мастер-ключ в памяти
+            self.__master_key = b"\x00" * len(self.__master_key)
+            self.__master_key = None
         if self._conn:
             self._conn.close()
             self._conn = None
 
     def _put(self, key: str, value: bytes) -> None:
-        """Записать значение в keystore."""
         conn = self._conn
         if conn is None:
             raise StorageError("Хранилище не инициализировано")
@@ -221,12 +201,10 @@ class KeyStore:
         )
 
     def _get(self, key: str) -> bytes | None:
-        """Прочитать значение из keystore."""
         conn = self._conn
         if conn is None:
             raise StorageError("Хранилище не инициализировано")
         row = conn.execute(
-            "SELECT value FROM keystore WHERE key = ?",
-            (key,),
+            "SELECT value FROM keystore WHERE key = ?", (key,)
         ).fetchone()
         return row[0] if row else None
