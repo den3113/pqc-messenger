@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import curses
+import locale
 import logging
 import sys
 import textwrap
+import unicodedata
 from datetime import datetime
 
 from pqc_messenger.client.app import PQCMessengerApp
@@ -64,6 +66,50 @@ class TUI:
     C_STATUS = 5
     C_DIM    = 6
     C_BOLD   = 7
+
+    # Категории Unicode, которые мы считаем допустимыми для ввода.
+    # L=буквы, N=цифры, P=пунктуация, S=символы, Z=пробелы
+    _ALLOWED_CATEGORIES = frozenset({
+        "Lu", "Ll", "Lt", "Lm", "Lo",    # буквы
+        "Nd", "Nl", "No",                 # цифры
+        "Pc", "Pd", "Ps", "Pe", "Pi",    # пунктуация
+        "Pf", "Po",
+        "Sm", "Sc", "Sk", "So",           # символы (кроме emoji — фильтр ниже)
+        "Zs",                              # пробел
+    })
+
+    @staticmethod
+    def _is_printable_char(ch: str) -> bool:
+        """Допустим ли символ для ввода?
+
+        Разрешены: латиница, кириллица, цифры, пунктуация и пр.
+        Запрещены: управляющие символы, эмодзи, CJK-иероглифы.
+        """
+        if len(ch) != 1:
+            return False
+        cp = ord(ch)
+        # Управляющие символы
+        if cp < 32:
+            return False
+        # CJK Unified Ideographs и расширения
+        if 0x4E00 <= cp <= 0x9FFF:   return False
+        if 0x3400 <= cp <= 0x4DBF:   return False
+        if 0x20000 <= cp <= 0x2A6DF: return False
+        if 0x2A700 <= cp <= 0x2CEAF: return False
+        if 0xF900 <= cp <= 0xFAFF:   return False
+        # Emoji: Emoticons, Misc Symbols & Pictographs, Supplemental, Transport, etc.
+        if 0x1F600 <= cp <= 0x1F64F: return False
+        if 0x1F300 <= cp <= 0x1F5FF: return False
+        if 0x1F680 <= cp <= 0x1F6FF: return False
+        if 0x1F900 <= cp <= 0x1F9FF: return False
+        if 0x1FA00 <= cp <= 0x1FA6F: return False
+        if 0x1FA70 <= cp <= 0x1FAFF: return False
+        if 0x2600 <= cp <= 0x26FF:   return False
+        if 0x2700 <= cp <= 0x27BF:   return False
+        if 0xFE00 <= cp <= 0xFE0F:   return False  # Variation selectors
+        if 0x200D == cp:             return False  # ZWJ
+        cat = unicodedata.category(ch)
+        return cat in TUI._ALLOWED_CATEGORIES
 
     def __init__(self, stdscr: curses.window) -> None:
         self._scr        = stdscr
@@ -197,22 +243,37 @@ class TUI:
         self._scr.nodelay(False)
         try:
             while True:
-                key = self._scr.getch()
-                if key in (curses.KEY_ENTER, 10, 13):
-                    break
-                elif key in (curses.KEY_BACKSPACE, 127, 8):
-                    p = self._cursor_pos
-                    if p > 0:
-                        self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
-                        self._cursor_pos -= 1
-                elif key == curses.KEY_RESIZE:
-                    self._rebuild()
-                    self._draw_messages()
-                    self._draw_status(self._last_status)
-                elif 32 <= key <= 126:
-                    p = self._cursor_pos
-                    self._input_buf = self._input_buf[:p] + chr(key) + self._input_buf[p:]
-                    self._cursor_pos += 1
+                try:
+                    wch = self._scr.get_wch()
+                except curses.error:
+                    continue
+
+                if isinstance(wch, int):
+                    # Специальная клавиша
+                    if wch in (curses.KEY_ENTER, 10, 13):
+                        break
+                    elif wch in (curses.KEY_BACKSPACE, 127, 8):
+                        p = self._cursor_pos
+                        if p > 0:
+                            self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
+                            self._cursor_pos -= 1
+                    elif wch == curses.KEY_RESIZE:
+                        self._rebuild()
+                        self._draw_messages()
+                        self._draw_status(self._last_status)
+                else:
+                    # wch — строка (один символ)
+                    if wch in ("\n", "\r"):
+                        break
+                    elif wch in ("\x7f", "\x08"):
+                        p = self._cursor_pos
+                        if p > 0:
+                            self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
+                            self._cursor_pos -= 1
+                    elif self._is_printable_char(wch):
+                        p = self._cursor_pos
+                        self._input_buf = self._input_buf[:p] + wch + self._input_buf[p:]
+                        self._cursor_pos += 1
                 self._draw_input(prompt, mask=True)
                 curses.doupdate()
         finally:
@@ -224,52 +285,68 @@ class TUI:
 
     # ── обработка клавиш в основном цикле ─────────────────────────────────────
 
-    def handle_key(self, key: int) -> str | None:
-        if key == curses.KEY_RESIZE:
-            self._rebuild(); self.full_refresh()
+    def handle_key(self, wch: int | str) -> str | None:
+        """Обработка ввода от get_wch().
 
-        elif key in (curses.KEY_ENTER, 10, 13):
-            line = self._input_buf
-            self._input_buf, self._cursor_pos, self._scroll_off = "", 0, 0
-            return line
+        wch — либо int (специальная/функциональная клавиша),
+              либо str (один Unicode-символ).
+        """
+        if isinstance(wch, int):
+            # ── Специальные клавиши (int) ─────────────────────────────────
+            if wch == curses.KEY_RESIZE:
+                self._rebuild(); self.full_refresh()
 
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            p = self._cursor_pos
-            if p > 0:
-                self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
-                self._cursor_pos -= 1
+            elif wch in (curses.KEY_ENTER,):
+                line = self._input_buf
+                self._input_buf, self._cursor_pos, self._scroll_off = "", 0, 0
+                return line
 
-        elif key == curses.KEY_DC:
-            p = self._cursor_pos
-            if p < len(self._input_buf):
-                self._input_buf = self._input_buf[:p] + self._input_buf[p+1:]
+            elif wch in (curses.KEY_BACKSPACE,):
+                p = self._cursor_pos
+                if p > 0:
+                    self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
+                    self._cursor_pos -= 1
 
-        elif key == curses.KEY_LEFT:
-            if self._cursor_pos > 0: self._cursor_pos -= 1
-        elif key == curses.KEY_RIGHT:
-            if self._cursor_pos < len(self._input_buf): self._cursor_pos += 1
-        elif key == curses.KEY_HOME: self._cursor_pos = 0
-        elif key == curses.KEY_END:  self._cursor_pos = len(self._input_buf)
+            elif wch == curses.KEY_DC:
+                p = self._cursor_pos
+                if p < len(self._input_buf):
+                    self._input_buf = self._input_buf[:p] + self._input_buf[p+1:]
 
-        elif key in (curses.KEY_UP, curses.KEY_PPAGE):
-            page = max(1, self._msg_h - 2) if key == curses.KEY_PPAGE else 1
-            self._scroll_off = min(self._scroll_off + page,
-                                   max(0, len(self._lines) - self._msg_h))
-            self._draw_messages()
+            elif wch == curses.KEY_LEFT:
+                if self._cursor_pos > 0: self._cursor_pos -= 1
+            elif wch == curses.KEY_RIGHT:
+                if self._cursor_pos < len(self._input_buf): self._cursor_pos += 1
+            elif wch == curses.KEY_HOME: self._cursor_pos = 0
+            elif wch == curses.KEY_END:  self._cursor_pos = len(self._input_buf)
 
-        elif key in (curses.KEY_DOWN, curses.KEY_NPAGE):
-            page = max(1, self._msg_h - 2) if key == curses.KEY_NPAGE else 1
-            self._scroll_off = max(0, self._scroll_off - page)
-            self._draw_messages()
+            elif wch in (curses.KEY_UP, curses.KEY_PPAGE):
+                page = max(1, self._msg_h - 2) if wch == curses.KEY_PPAGE else 1
+                self._scroll_off = min(self._scroll_off + page,
+                                       max(0, len(self._lines) - self._msg_h))
+                self._draw_messages()
 
-        elif key > 31:
-            try:
-                char = chr(key)
-            except (ValueError, OverflowError):
-                return None
-            p = self._cursor_pos
-            self._input_buf = self._input_buf[:p] + char + self._input_buf[p:]
-            self._cursor_pos += 1
+            elif wch in (curses.KEY_DOWN, curses.KEY_NPAGE):
+                page = max(1, self._msg_h - 2) if wch == curses.KEY_NPAGE else 1
+                self._scroll_off = max(0, self._scroll_off - page)
+                self._draw_messages()
+
+        else:
+            # ── Символьный ввод (str) ─────────────────────────────────────
+            if wch in ("\n", "\r"):
+                line = self._input_buf
+                self._input_buf, self._cursor_pos, self._scroll_off = "", 0, 0
+                return line
+
+            elif wch in ("\x7f", "\x08"):       # Backspace как символ
+                p = self._cursor_pos
+                if p > 0:
+                    self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
+                    self._cursor_pos -= 1
+
+            elif self._is_printable_char(wch):
+                p = self._cursor_pos
+                self._input_buf = self._input_buf[:p] + wch + self._input_buf[p:]
+                self._cursor_pos += 1
 
         return None
 
@@ -315,11 +392,13 @@ class CLI:
         curses.doupdate()
 
         while self._running:
-            key = t._scr.getch()
-            if key == curses.ERR:
+            try:
+                wch = t._scr.get_wch()
+            except curses.error:
+                # nodelay mode — нет ввода
                 await asyncio.sleep(0.02)
                 continue
-            result = t.handle_key(key)
+            result = t.handle_key(wch)
             if result is not None:
                 line = result.strip()
                 if line:
@@ -620,6 +699,9 @@ class CLI:
 
 
 def main() -> None:
+    # Устанавливаем локаль для корректной работы get_wch() с UTF-8
+    locale.setlocale(locale.LC_ALL, "")
+
     parser = argparse.ArgumentParser(description="PQC-Messenger")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--relay", default=DEFAULT_RELAY_URL)
