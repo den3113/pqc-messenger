@@ -10,7 +10,7 @@ class PQCError(Exception):
     """Базовое исключение PQC-Messenger."""
 
 
-# ── Криптографические ошибки ──────────────────
+
 
 class CryptoError(PQCError):
     """Общая ошибка криптографического модуля."""
@@ -32,7 +32,7 @@ class KeyExpiredError(KeyError_):
     """Сессионный ключ истёк."""
 
 
-# ── Ошибки протокола ────────────────────────
+
 
 class ProtocolError(PQCError):
     """Общая ошибка протокола."""
@@ -42,7 +42,7 @@ class HandshakeError(ProtocolError):
     """Ошибка при выполнении Handshake."""
 
 
-# Fix #3: явное исключение для отклонённых неизвестных инициаторов
+
 class UnknownPeerError(HandshakeError):
     """
     Handshake отклонён: инициатор не найден в списке доверенных контактов.
@@ -55,7 +55,7 @@ class PacketError(ProtocolError):
     """Ошибка при разборе или валидации пакета."""
 
 
-# Fix #4: явное исключение для устаревших / повторно используемых пакетов
+
 class PacketReplayError(PacketError):
     """
     Пакет отклонён: временная метка слишком далека от текущего времени
@@ -67,7 +67,7 @@ class SessionError(ProtocolError):
     """Ошибка управления сессией."""
 
 
-# ── Ошибки хранилища ────────────────────────
+
 
 class StorageError(PQCError):
     """Общая ошибка хранилища."""
@@ -77,7 +77,7 @@ class DatabaseError(StorageError):
     """Ошибка при работе с базой данных."""
 
 
-# ── Сетевые ошибки ──────────────────────────
+
 
 class NetworkError(PQCError):
     """Общая сетевая ошибка."""

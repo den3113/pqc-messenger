@@ -67,15 +67,13 @@ class TUI:
     C_DIM    = 6
     C_BOLD   = 7
 
-    # Категории Unicode, которые мы считаем допустимыми для ввода.
-    # L=буквы, N=цифры, P=пунктуация, S=символы, Z=пробелы
     _ALLOWED_CATEGORIES = frozenset({
-        "Lu", "Ll", "Lt", "Lm", "Lo",    # буквы
-        "Nd", "Nl", "No",                 # цифры
-        "Pc", "Pd", "Ps", "Pe", "Pi",    # пунктуация
+        "Lu", "Ll", "Lt", "Lm", "Lo",
+        "Nd", "Nl", "No",
+        "Pc", "Pd", "Ps", "Pe", "Pi",
         "Pf", "Po",
-        "Sm", "Sc", "Sk", "So",           # символы (кроме emoji — фильтр ниже)
-        "Zs",                              # пробел
+        "Sm", "Sc", "Sk", "So",
+        "Zs",
     })
 
     @staticmethod
@@ -88,16 +86,13 @@ class TUI:
         if len(ch) != 1:
             return False
         cp = ord(ch)
-        # Управляющие символы
         if cp < 32:
             return False
-        # CJK Unified Ideographs и расширения
         if 0x4E00 <= cp <= 0x9FFF:   return False
         if 0x3400 <= cp <= 0x4DBF:   return False
         if 0x20000 <= cp <= 0x2A6DF: return False
         if 0x2A700 <= cp <= 0x2CEAF: return False
         if 0xF900 <= cp <= 0xFAFF:   return False
-        # Emoji: Emoticons, Misc Symbols & Pictographs, Supplemental, Transport, etc.
         if 0x1F600 <= cp <= 0x1F64F: return False
         if 0x1F300 <= cp <= 0x1F5FF: return False
         if 0x1F680 <= cp <= 0x1F6FF: return False
@@ -106,8 +101,8 @@ class TUI:
         if 0x1FA70 <= cp <= 0x1FAFF: return False
         if 0x2600 <= cp <= 0x26FF:   return False
         if 0x2700 <= cp <= 0x27BF:   return False
-        if 0xFE00 <= cp <= 0xFE0F:   return False  # Variation selectors
-        if 0x200D == cp:             return False  # ZWJ
+        if 0xFE00 <= cp <= 0xFE0F:   return False
+        if 0x200D == cp:             return False
         cat = unicodedata.category(ch)
         return cat in TUI._ALLOWED_CATEGORIES
 
@@ -134,8 +129,6 @@ class TUI:
         curses.noecho()
         stdscr.keypad(True)
         stdscr.nodelay(True)
-        # Очищаем stdscr — он служит фоном, дочерние окна рисуются поверх.
-        # Без этого stdscr может перекрывать msg_win/sts_win/inp_win.
         stdscr.erase()
         stdscr.noutrefresh()
         self._rebuild()
@@ -150,7 +143,7 @@ class TUI:
                                       msg_h + self.STATUS_HEIGHT, 0)
         self._msg_win.scrollok(False)
 
-    # ── добавление строк ──────────────────────────────────────────────────────
+
 
     def add_line(self, text: str, cp: int = 0) -> None:
         for line in (textwrap.wrap(text, max(self._w - 2, 10)) or [""]):
@@ -171,7 +164,7 @@ class TUI:
     def add_info    (self, text: str) -> None: self.add_line(f"  {text}",   self.C_DIM)
     def add_header  (self, text: str) -> None: self.add_line(text,          self.C_BOLD)
 
-    # ── отрисовка ─────────────────────────────────────────────────────────────
+
 
     def _draw_messages(self) -> None:
         win = self._msg_win
@@ -232,7 +225,7 @@ class TUI:
         self._draw_status(text)
         curses.doupdate()
 
-    # ── inline ввод пароля (маскировка, без выхода из curses) ─────────────────
+
 
     def read_password(self, prompt: str) -> str:
         saved_buf, saved_pos = self._input_buf, self._cursor_pos
@@ -249,7 +242,6 @@ class TUI:
                     continue
 
                 if isinstance(wch, int):
-                    # Специальная клавиша
                     if wch in (curses.KEY_ENTER, 10, 13):
                         break
                     elif wch in (curses.KEY_BACKSPACE, 127, 8):
@@ -262,7 +254,6 @@ class TUI:
                         self._draw_messages()
                         self._draw_status(self._last_status)
                 else:
-                    # wch — строка (один символ)
                     if wch in ("\n", "\r"):
                         break
                     elif wch in ("\x7f", "\x08"):
@@ -283,16 +274,8 @@ class TUI:
         self._input_buf, self._cursor_pos = saved_buf, saved_pos
         return result
 
-    # ── обработка клавиш в основном цикле ─────────────────────────────────────
-
     def handle_key(self, wch: int | str) -> str | None:
-        """Обработка ввода от get_wch().
-
-        wch — либо int (специальная/функциональная клавиша),
-              либо str (один Unicode-символ).
-        """
         if isinstance(wch, int):
-            # ── Специальные клавиши (int) ─────────────────────────────────
             if wch == curses.KEY_RESIZE:
                 self._rebuild(); self.full_refresh()
 
@@ -331,13 +314,12 @@ class TUI:
                 self._draw_messages()
 
         else:
-            # ── Символьный ввод (str) ─────────────────────────────────────
             if wch in ("\n", "\r"):
                 line = self._input_buf
                 self._input_buf, self._cursor_pos, self._scroll_off = "", 0, 0
                 return line
 
-            elif wch in ("\x7f", "\x08"):       # Backspace как символ
+            elif wch in ("\x7f", "\x08"):
                 p = self._cursor_pos
                 if p > 0:
                     self._input_buf = self._input_buf[:p-1] + self._input_buf[p:]
@@ -360,7 +342,7 @@ class CLI:
         self._tui: TUI | None = None
         self._relay_url = DEFAULT_RELAY_URL
 
-    # ── запуск ───────────────────────────────────────────────────────────────
+
 
     def run(self, relay_url: str = DEFAULT_RELAY_URL) -> None:
         self._relay_url = relay_url
@@ -371,14 +353,12 @@ class CLI:
             self._tui = TUI(stdscr)
             t = self._tui
             t.add_header("╔══════════════════════════════════════════╗")
-            t.add_header("║         PQC-Messenger  v0.1.0            ║")
+            t.add_header("║         PQC-Messenger  v0.5.6            ║")
             t.add_header("║  X25519 + Kyber-768  │  Double Ratchet   ║")
             t.add_header("╚══════════════════════════════════════════╝")
             t.add_system("Введите /login для начала работы")
             t.add_info("PgUp/PgDn — прокрутка  │  ← → Home End — курсор")
             self._update_status()
-            # full_refresh уже вызван внутри каждого add_* через doupdate,
-            # но явный вызов гарантирует корректный финальный статус и промпт
             t.full_refresh()
             asyncio.run(self._main_loop())
         finally:
@@ -395,7 +375,6 @@ class CLI:
             try:
                 wch = t._scr.get_wch()
             except curses.error:
-                # nodelay mode — нет ввода
                 await asyncio.sleep(0.02)
                 continue
             result = t.handle_key(wch)
@@ -406,7 +385,7 @@ class CLI:
             t._draw_input(self._prompt())
             curses.doupdate()
 
-    # ── промпт / статус ───────────────────────────────────────────────────────
+
 
     def _prompt(self) -> str:
         return f"[{self._chat_name}] > " if self._chat_name else "pqc > "
@@ -417,7 +396,6 @@ class CLI:
         parts = ["PQC-Messenger"]
         if self._app.is_initialized:
             parts.append(self._app.identity_id[:12] + "...")  # type: ignore
-            # Пункт 8: статус Kyber в строке состояния
             kyber_label = "Kyber-768✓" if self._app.kyber_is_real else "Kyber-ЭМУЛ⚠"
             parts.append(kyber_label)
         else:
@@ -428,13 +406,13 @@ class CLI:
             parts.append(f"чат: {self._chat_name}  (/back — выйти)")
         t.set_status("  │  ".join(parts))
 
-    # ── диспетчер ─────────────────────────────────────────────────────────────
+
 
     async def _dispatch(self, line: str) -> None:
         t = self._tui
         assert t
 
-        # Режим чата: только /back и /quit — команды
+
         if self._chat_id:
             cmd = line.lower()
             if cmd in ("/back", "/exit"):
@@ -447,7 +425,7 @@ class CLI:
                 await self._send_message(line)
             return
 
-        # Главное меню
+
         if not line.startswith("/"):
             t.add_info("Используйте /chat <номер> для начала диалога")
             return
@@ -475,7 +453,7 @@ class CLI:
         else:
             t.add_error(f"Неизвестная команда: {cmd}  (попробуйте /help)")
 
-    # ── команды ───────────────────────────────────────────────────────────────
+
 
     async def _cmd_login(self, args: str) -> None:
         t = self._tui
@@ -498,7 +476,7 @@ class CLI:
         else:
             t.add_system("Хранилище разблокировано")
         t.add_info(f"Ваш ID: {Identity.format_fingerprint(self._app.identity_id)}")  # type: ignore
-        # Пункт 8: информируем о статусе Kyber
+
         if self._app.kyber_is_real:
             t.add_system("Kyber-768 (liboqs): постквантовая защита АКТИВНА")
         else:
@@ -578,7 +556,6 @@ class CLI:
             t.add_error("Введите номер контакта")
 
     async def _cmd_delete(self, args: str) -> None:
-        """Пункт 7: удалить контакт и все данные с ним."""
         t = self._tui
         assert t
         if not self._app.is_initialized:
@@ -598,7 +575,7 @@ class CLI:
             t.add_error(f"Удалить {name} и всю историю? Введите ДА:")
             confirm = t.read_password("Подтверждение: ")
             if confirm.strip() == "ДА":
-                # Выходим из чата если удаляем текущего собеседника
+
                 if self._chat_id == contact.id:
                     self._chat_id = self._chat_name = ""
                 self._app.delete_contact(contact.id)
@@ -664,7 +641,7 @@ class CLI:
     async def _cmd_quit(self, args: str) -> None:
         self._running = False
 
-    # ── отправка сообщения ────────────────────────────────────────────────────
+
 
     async def _send_message(self, text: str) -> None:
         t = self._tui
@@ -678,7 +655,7 @@ class CLI:
         except PQCError as e:
             t.add_error(str(e))
 
-    # ── callback входящих ─────────────────────────────────────────────────────
+
 
     def _on_message(self, contact_id: str, text: str) -> None:
         t = self._tui
@@ -699,7 +676,6 @@ class CLI:
 
 
 def main() -> None:
-    # Устанавливаем локаль для корректной работы get_wch() с UTF-8
     locale.setlocale(locale.LC_ALL, "")
 
     parser = argparse.ArgumentParser(description="PQC-Messenger")

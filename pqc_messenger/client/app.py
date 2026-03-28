@@ -54,10 +54,9 @@ class PQCMessengerApp:
         self._sessions: dict[str, Session] = {}
         self._pending_handshakes: dict[str, tuple[bytes, bytes, bytes]] = {}
         self._message_callback = None
-        # Пункт 8: предупреждение о Kyber-эмуляции выводится один раз
         self._kyber_warning_shown = False
 
-    # ── Свойства ──────────────────────────────────────────────────────────────
+
 
     @property
     def identity(self) -> IdentityKeyBundle | None:
@@ -91,7 +90,7 @@ class PQCMessengerApp:
         """True если используется настоящий Kyber-768 (liboqs), False = эмуляция."""
         return bool(_HAS_LIBOQS)
 
-    # ── Инициализация ─────────────────────────────────────────────────────────
+
 
     def initialize(self, password: str) -> bool:
         """
@@ -125,15 +124,14 @@ class PQCMessengerApp:
                     "Идентичность загружена: %s",
                     Identity.format_fingerprint(self._identity.fingerprint()),
                 )
-                # Восстанавливаем сохранённые сессии из БД
                 self._restore_sessions()
 
-        # Пункт 4: удаляем истёкшие сессии
+
         expired = self._db.delete_expired_sessions(SESSION_TTL)
         if expired:
             logger.info("Удалено %d истёкших сессий при запуске", expired)
 
-        # Пункт 8: предупреждение об эмуляции Kyber
+
         if not _HAS_LIBOQS and not self._kyber_warning_shown:
             self._kyber_warning_shown = True
             msg = (
@@ -155,11 +153,8 @@ class PQCMessengerApp:
             rows = self._db.get_all_sessions()
             for session_id, contact_id, ratchet_state_raw, last_activity in rows:
                 try:
-                    # ratchet_state в БД хранится незашифрованным (keystore хранит отдельно)
-                    # Пробуем загрузить из keystore (зашифровано)
                     state_bytes = self._keystore.load_session_state(session_id)
                     if state_bytes is None:
-                        # Fallback: используем данные из БД напрямую
                         state_bytes = ratchet_state_raw
 
                     ratchet = SessionRatchet.deserialize(state_bytes)
@@ -186,13 +181,12 @@ class PQCMessengerApp:
         except Exception as e:
             logger.error("Ошибка восстановления сессий: %s", e)
 
-    # ── Подключение ───────────────────────────────────────────────────────────
+
 
     async def connect(self, relay_url: str = DEFAULT_RELAY_URL) -> None:
         if not self.is_initialized:
             raise PQCError("Приложение не инициализировано")
 
-        # Пункт 1: регистрируем callback переподключения
         self._transport.set_reconnect_callback(self._on_reconnected)
 
         await self._transport.connect(relay_url)
@@ -202,15 +196,12 @@ class PQCMessengerApp:
         logger.info("Подключено к relay: %s", relay_url)
 
     async def _on_reconnected(self) -> None:
-        """
-        Пункт 1: вызывается транспортом после успешного переподключения.
-        Уведомляем пользователя.
-        """
+        """Вызывается транспортом после успешного переподключения."""
         logger.info("Переподключение к relay выполнено успешно")
         if self._message_callback:
             self._message_callback("system", "Связь с relay восстановлена")
 
-    # ── Контакты ──────────────────────────────────────────────────────────────
+
 
     def add_contact(
         self,
@@ -229,10 +220,8 @@ class PQCMessengerApp:
         )
 
     def delete_contact(self, contact_id: str) -> None:
-        """
-        Пункт 7: удалить контакт, все сообщения и сессию с ним.
-        """
-        # Уничтожаем активную сессию если есть
+        """Удалить контакт, все сообщения и сессию с ним."""
+
         session = self._sessions.pop(contact_id, None)
         if session:
             session.destroy()
@@ -243,7 +232,7 @@ class PQCMessengerApp:
     def get_contacts(self) -> list[Contact]:
         return self._db.get_all_contacts()
 
-    # ── Сессии ────────────────────────────────────────────────────────────────
+
 
     async def start_session(self, contact_id: str) -> None:
         if not self.is_initialized:
@@ -277,7 +266,7 @@ class PQCMessengerApp:
             contact.kyber_public_key,
         )
 
-    # ── Сообщения ─────────────────────────────────────────────────────────────
+
 
     async def send_message(self, contact_id: str, text: str) -> None:
         session = self._sessions.get(contact_id)
@@ -298,7 +287,6 @@ class PQCMessengerApp:
         packet = session.send_message(text)
         await self._transport.send_packet(packet)
 
-        # Пункт 6: используем encrypt_for_storage вместо _master_key напрямую
         encrypted_for_storage = self._keystore.encrypt_for_storage(
             text.encode("utf-8")
         )
@@ -314,7 +302,6 @@ class PQCMessengerApp:
         messages = []
         for msg_id, direction, encrypted_content, timestamp in raw_messages:
             try:
-                # Пункт 6: decrypt_from_storage вместо _master_key
                 content = self._keystore.decrypt_from_storage(
                     encrypted_content
                 ).decode("utf-8")
@@ -330,7 +317,7 @@ class PQCMessengerApp:
 
         return messages
 
-    # ── Обработка входящих ────────────────────────────────────────────────────
+
 
     async def _process_incoming(self) -> None:
         try:
@@ -480,7 +467,6 @@ class PQCMessengerApp:
         try:
             text = session.receive_message(packet)
 
-            # Пункт 6: encrypt_for_storage вместо _master_key
             encrypted_for_storage = self._keystore.encrypt_for_storage(
                 text.encode("utf-8")
             )
@@ -512,7 +498,7 @@ class PQCMessengerApp:
     def set_message_callback(self, callback) -> None:
         self._message_callback = callback
 
-    # ── Очистка ───────────────────────────────────────────────────────────────
+
 
     async def wipe_all(self) -> None:
         for session in self._sessions.values():
@@ -526,7 +512,6 @@ class PQCMessengerApp:
         logger.warning("Все данные полностью уничтожены (WIPE)")
 
     def shutdown(self) -> None:
-        # Пункт 4: удаляем истёкшие сессии при завершении
         self._db.delete_expired_sessions(SESSION_TTL)
         for session in self._sessions.values():
             self._persist_session(session)

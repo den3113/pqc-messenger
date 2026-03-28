@@ -56,15 +56,11 @@ class AEAD:
                 f"Ключ AES-256 должен быть {AES_KEY_SIZE} байт, получено {len(key)}"
             )
 
-        # Генерация случайного nonce (12 байт)
-        # ВАЖНО: nonce НИКОГДА не должен повторяться с одним и тем же ключом
         nonce = os.urandom(GCM_NONCE_SIZE)
 
         aesgcm = AESGCM(key)
-        # ciphertext_with_tag = ciphertext || tag (tag 16 байт, добавляется автоматически)
         ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext, aad if aad else None)
 
-        # Формат: nonce (12) + ciphertext + tag (16)
         return nonce + ciphertext_with_tag
 
     @staticmethod
@@ -99,7 +95,6 @@ class AEAD:
                 f"Данные слишком короткие: минимум {min_size} байт, получено {len(data)}"
             )
 
-        # Разделение: nonce (12) | ciphertext + tag
         nonce = data[:GCM_NONCE_SIZE]
         ciphertext_with_tag = data[GCM_NONCE_SIZE:]
 
