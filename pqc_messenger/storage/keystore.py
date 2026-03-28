@@ -1,7 +1,7 @@
 """
 Зашифрованное хранилище ключей.
 
-Fix #6: при инициализации устанавливается wal_autocheckpoint=100,
+При инициализации устанавливается wal_autocheckpoint=100,
         при закрытии выполняется PRAGMA wal_checkpoint(TRUNCATE),
         чтобы WAL-файл не хранил данные дольше необходимого.
 """
@@ -15,7 +15,7 @@ import sqlite3
 from pqc_messenger.common.constants import (
     DEFAULT_DATA_DIR,
     KEYSTORE_FILENAME,
-    KEYSTORE_WAL_AUTOCHECKPOINT,   # Fix #6
+    KEYSTORE_WAL_AUTOCHECKPOINT,
 )
 from pqc_messenger.common.exceptions import CryptoError, StorageError
 from pqc_messenger.common.logging import get_logger
@@ -41,13 +41,13 @@ class KeyStore:
         self.__master_key: bytes | None = None
         self._conn: sqlite3.Connection | None = None
 
-    # ── Инициализация ─────────────────────────────────────────────────────────
+
 
     def initialize(self, password: str) -> bool:
         """
         Инициализировать хранилище.
 
-        Fix #6: устанавливает wal_autocheckpoint=100, чтобы WAL-файл
+        Устанавливает wal_autocheckpoint=100, чтобы WAL-файл
                 усекался чаще и не хранил лишние зашифрованные блоки.
 
         Returns:
@@ -63,7 +63,7 @@ class KeyStore:
 
         self._conn = sqlite3.connect(self._ks_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        # Fix #6: уменьшаем порог авточекпойнта до 100 страниц
+
         self._conn.execute(
             f"PRAGMA wal_autocheckpoint={KEYSTORE_WAL_AUTOCHECKPOINT}"
         )
@@ -126,7 +126,7 @@ class KeyStore:
             raise StorageError("Хранилище не разблокировано")
         return AEAD.decrypt(self.__master_key, ciphertext)
 
-    # ── Identity ─────────────────────────────────────────────────────────────
+
 
     def store_identity(self, bundle: IdentityKeyBundle) -> None:
         if self.__master_key is None:
@@ -152,7 +152,7 @@ class KeyStore:
         except Exception as e:
             raise StorageError(f"Ошибка загрузки identity: {e}") from e
 
-    # ── Session state ─────────────────────────────────────────────────────────
+
 
     def store_session_state(self, session_id: str, state: bytes) -> None:
         if self.__master_key is None:
@@ -168,7 +168,7 @@ class KeyStore:
             return None
         return AEAD.decrypt(self.__master_key, encrypted)
 
-    # ── Служебное ────────────────────────────────────────────────────────────
+
 
     def wipe(self) -> None:
         if self._conn:
@@ -180,7 +180,7 @@ class KeyStore:
 
     def close(self) -> None:
         """
-        Fix #6: перед закрытием выполняем TRUNCATE-чекпойнт,
+        Перед закрытием выполняем TRUNCATE-чекпойнт,
                 чтобы WAL-файл усекался и не хранил лишних данных на диске.
         """
         if self.__master_key:
@@ -188,7 +188,7 @@ class KeyStore:
             self.__master_key = None
         if self._conn:
             try:
-                # Fix #6: принудительный TRUNCATE checkpoint
+
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception as e:
                 logger.warning("Не удалось выполнить WAL checkpoint: %s", e)

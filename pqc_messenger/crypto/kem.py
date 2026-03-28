@@ -8,12 +8,8 @@
 Такая гибридная схема гарантирует безопасность, даже если один из
 алгоритмов окажется скомпрометированным.
 
-Fix #1: если Kyber-режимы несовместимы (один пир использует реальный Kyber,
-        другой — эмуляцию), HandshakeError поднимается немедленно вместо
-        тихой подстановки нулевого секрета.
-
-Fix #7: для комбинирования KEM-секретов используется отдельный info-тег
-        HKDF_INFO_KEM_COMBINE, отличный от HKDF_INFO_HANDSHAKE.
+При несовместимости Kyber-режимов (реальный Kyber ↔ эмуляция)
+HandshakeError поднимается немедленно.
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from pqc_messenger.common.constants import (
     AES_KEY_SIZE,
-    HKDF_INFO_KEM_COMBINE,   # Fix #7
+    HKDF_INFO_KEM_COMBINE,
 )
 from pqc_messenger.common.exceptions import CryptoError, HandshakeError
 from pqc_messenger.common.logging import get_logger
@@ -55,7 +51,7 @@ class HybridKEM:
     def _combine_secrets(
         x25519_secret: bytes,
         kyber_secret: bytes,
-        info: bytes = HKDF_INFO_KEM_COMBINE,  # Fix #7: собственный info-тег
+        info: bytes = HKDF_INFO_KEM_COMBINE,
     ) -> bytes:
         """
         Объединить два секрета через HKDF-SHA256.
@@ -86,13 +82,7 @@ class HybridKEM:
         """
         Выполнить гибридную инкапсуляцию (сторона отправителя).
 
-        Fix #1: если режимы Kyber несовместимы, выбрасывает HandshakeError.
-
-        Шаги:
-        1. Сгенерировать эфемерную пару X25519
-        2. Вычислить x25519_secret = ECDH(ephemeral, recipient_pub)
-        3. Инкапсулировать kyber_secret через ML-KEM
-        4. shared_secret = HKDF(x25519_secret || kyber_secret, info=kem-combine)
+        При несовместимости Kyber-режимов выбрасывает HandshakeError.
 
         Args:
             sender_x25519: Ключи отправителя.
@@ -103,22 +93,16 @@ class HybridKEM:
             HybridEncapsulation с общим секретом и данными для передачи.
 
         Raises:
-            HandshakeError: Если Kyber-режимы несовместимы (Fix #1).
+            HandshakeError: Если Kyber-режимы несовместимы.
         """
         try:
-            # 1. Эфемерный X25519 DH
             ephemeral = X25519KeyPair.generate()
             peer_pub = X25519KeyPair.public_from_bytes(recipient_x25519_pub)
             x25519_secret = ephemeral.shared_secret(peer_pub)
 
-            # 2. ML-KEM (Kyber) инкапсуляция
             kyber_kp = KyberKeyPair.generate()
-
-            # Fix #1: encapsulate теперь выбрасывает HandshakeError
-            # вместо возврата нулевого секрета при несовместимости режимов.
             kyber_secret, kyber_ct = kyber_kp.encapsulate(recipient_kyber_pub)
 
-            # 3. Комбинирование секретов через HKDF (Fix #7: отдельный info)
             shared_secret = HybridKEM._combine_secrets(x25519_secret, kyber_secret)
 
             logger.debug("Гибридная инкапсуляция выполнена успешно")
@@ -144,7 +128,7 @@ class HybridKEM:
         """
         Выполнить гибридную декапсуляцию (сторона получателя).
 
-        Fix #1: если Kyber-режимы несовместимы, выбрасывает HandshakeError.
+        При несовместимости Kyber-режимов выбрасывает HandshakeError.
 
         Шаги:
         1. Вычислить x25519_secret = ECDH(own_private, sender_ephemeral_pub)
@@ -161,17 +145,14 @@ class HybridKEM:
             32 байта общего секрета.
 
         Raises:
-            HandshakeError: Если Kyber-режимы несовместимы (Fix #1).
+            HandshakeError: Если Kyber-режимы несовместимы.
         """
         try:
-            # 1. X25519 ECDH
             peer_pub = X25519KeyPair.public_from_bytes(sender_x25519_ephemeral_pub)
             x25519_secret = recipient_x25519.shared_secret(peer_pub)
 
-            # 2. Kyber декапсуляция (Fix #1: выбрасывает при несовместимости)
             kyber_secret = recipient_kyber.decapsulate(kyber_ciphertext)
 
-            # 3. Комбинирование (Fix #7: отдельный info)
             shared_secret = HybridKEM._combine_secrets(x25519_secret, kyber_secret)
 
             logger.debug("Гибридная декапсуляция выполнена успешно")

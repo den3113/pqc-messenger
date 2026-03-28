@@ -1,8 +1,8 @@
 """
 Управление криптографическими сессиями.
 
-Fix #4: receive_message вызывает packet.validate_timestamp() перед расшифровкой.
-Fix #8: plaintext сообщений НИКОГДА не попадает в логи (документировано явно).
+receive_message вызывает packet.validate_timestamp() перед расшифровкой.
+Plaintext сообщений НИКОГДА не попадает в логи.
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ class Session:
         """
         Зашифровать и упаковать сообщение для отправки.
 
-        Fix #8: plaintext никогда не логируется.
+        Plaintext никогда не логируется.
 
         Args:
             plaintext: Текст сообщения.
@@ -93,7 +93,7 @@ class Session:
             )
 
             self.last_activity = time.time()
-            # Fix #8: логируем только метаданные (ID сессии, тип),
+
             # но НИКОГДА не содержимое сообщения.
             logger.debug("Сообщение зашифровано (сессия %s)", self.session_id[:8])
             return packet
@@ -105,8 +105,8 @@ class Session:
         """
         Расшифровать входящее сообщение.
 
-        Fix #4: перед расшифровкой проверяет свежесть временной метки пакета.
-        Fix #8: расшифрованный plaintext никогда не логируется.
+        Перед расшифровкой проверяет свежесть временной метки пакета.
+        Расшифрованный plaintext никогда не логируется.
 
         Args:
             packet: Полученный Packet с типом MESSAGE.
@@ -115,7 +115,7 @@ class Session:
             Расшифрованный текст сообщения.
 
         Raises:
-            PacketReplayError: Если пакет устарел (Fix #4).
+            PacketReplayError: Если пакет устарел.
             SessionError: При других ошибках расшифровки.
         """
         if packet.packet_type != PacketType.MESSAGE:
@@ -131,7 +131,7 @@ class Session:
         try:
             plaintext_bytes = self.ratchet.decrypt(packet.payload)
             self.last_activity = time.time()
-            # Fix #8: только метаданные в лог, plaintext — никогда.
+
             logger.debug("Сообщение расшифровано (сессия %s)", self.session_id[:8])
             return plaintext_bytes.decode("utf-8")
 

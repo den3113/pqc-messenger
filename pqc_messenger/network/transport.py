@@ -1,7 +1,7 @@
 """
 Клиентский WebSocket-транспорт с автопереподключением.
 
-Пункт 1: при обрыве соединения транспорт автоматически пытается
+При обрыве соединения транспорт автоматически пытается
 переподключиться с экспоненциальной задержкой.
 """
 
@@ -50,14 +50,13 @@ class Transport:
         self._reconnect_task: asyncio.Task | None = None
         self._connected = False
         self._reconnect_enabled = False
-        # Callback вызывается при успешном переподключении
         self._on_reconnect: asyncio.coroutines | None = None
 
     @property
     def is_connected(self) -> bool:
         return self._connected and self._ws is not None
 
-    # ── Подключение ───────────────────────────────────────────────────────────
+
 
     async def connect(self, relay_url: str = DEFAULT_RELAY_URL) -> None:
         if websockets is None:
@@ -89,7 +88,7 @@ class Transport:
         reg_msg = RelayMessage.register(identity_hash)
         await self._ws.send(reg_msg.to_json())  # type: ignore[union-attr]
 
-        # Ждём ACK (пропускаем DELIVER которые могут прийти раньше)
+
         try:
             deadline = asyncio.get_event_loop().time() + 10.0
             while True:
@@ -127,7 +126,7 @@ class Transport:
         """Установить async-callback вызываемый после успешного переподключения."""
         self._on_reconnect = coro_fn
 
-    # ── Отправка ─────────────────────────────────────────────────────────────
+
 
     async def send_packet(self, packet: Packet) -> None:
         if not self.is_connected:
@@ -144,7 +143,7 @@ class Transport:
         except Exception as e:
             raise NetworkError(f"Ошибка отправки пакета: {e}") from e
 
-    # ── Получение ─────────────────────────────────────────────────────────────
+
 
     async def receive_packets(self) -> AsyncIterator[Packet]:
         while self.is_connected or self._reconnect_enabled:
@@ -156,7 +155,8 @@ class Transport:
             except asyncio.TimeoutError:
                 continue
 
-    # ── Слушатель + автопереподключение ──────────────────────────────────────
+
+
 
     async def _listen(self) -> None:
         """Фоновый слушатель. При обрыве запускает цикл переподключения."""
@@ -183,16 +183,13 @@ class Transport:
         finally:
             self._connected = False
             self._ws = None
-            # Запускаем автопереподключение если не было явного disconnect()
+
             if self._reconnect_enabled and self._identity_hash:
                 logger.info("Соединение потеряно — запускаем автопереподключение")
                 self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
-        """
-        Пункт 1: Экспоненциальная задержка переподключения.
-        RECONNECT_DELAY_MIN → ... → RECONNECT_DELAY_MAX, затем фиксированная пауза.
-        """
+        """Экспоненциальная задержка переподключения."""
         attempt = 0
         while self._reconnect_enabled:
             delay = min(
@@ -206,7 +203,7 @@ class Transport:
 
             try:
                 await self._do_connect()
-                # Повторная регистрация
+
                 reg_msg = RelayMessage.register(self._identity_hash)
                 await self._ws.send(reg_msg.to_json())  # type: ignore[union-attr]
 
@@ -242,11 +239,10 @@ class Transport:
                 logger.info("Переподключено и зарегистрировано успешно")
                 self._listener_task = asyncio.create_task(self._listen())
 
-                # Уведомляем приложение (например, чтобы переотправить pending)
                 if self._on_reconnect:
                     await self._on_reconnect()
 
-                return  # Успех — выходим из цикла
+                return
 
             except Exception as e:
                 logger.warning("Попытка переподключения %d не удалась: %s", attempt + 1, e)
@@ -254,7 +250,7 @@ class Transport:
                 self._ws = None
                 attempt += 1
 
-    # ── Отключение ────────────────────────────────────────────────────────────
+
 
     async def disconnect(self) -> None:
         self._reconnect_enabled = False

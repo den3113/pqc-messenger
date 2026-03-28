@@ -9,10 +9,8 @@
 если библиотека liboqs-python недоступна.
 При наличии liboqs модуль автоматически переключится на реальный Kyber.
 
-Fix #1: при несовместимости Kyber-режимов (один пир использует реальный Kyber,
-        другой — эмуляцию) методы encapsulate/decapsulate выбрасывают
-        HandshakeError вместо тихой подстановки нулевого секрета.
-        Это гарантирует, что постквантовая защита не деградирует молча.
+При несовместимости Kyber-режимов (реальный Kyber ↔ эмуляция)
+encapsulate/decapsulate выбрасывают HandshakeError.
 """
 
 from __future__ import annotations
@@ -37,10 +35,8 @@ from pqc_messenger.common.logging import get_logger
 
 logger = get_logger("crypto.keys")
 
-# Попытка импорта liboqs для реального Kyber
 _HAS_LIBOQS = False
 
-# Автоматический поиск liboqs.so в lib/ директории проекта
 _PROJECT_LIB_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "lib",
@@ -75,7 +71,6 @@ except ImportError:
     )
 
 
-# ─── X25519 ──────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -136,9 +131,8 @@ class KyberKeyPair:
     При отсутствии liboqs используется эмуляция через X25519.
     Эмуляция сохраняет интерфейс, но НЕ обеспечивает постквантовую стойкость.
 
-    Fix #1: encapsulate / decapsulate выбрасывают HandshakeError при
-    несовместимости режимов (реальный Kyber ↔ эмуляция) вместо
-    молчаливого возврата нулевого секрета.
+    encapsulate / decapsulate выбрасывают HandshakeError при
+    несовместимости режимов (реальный Kyber ↔ эмуляция).
     """
 
     private_key: bytes
@@ -165,11 +159,8 @@ class KyberKeyPair:
                 _is_real_kyber=False,
             )
 
-    # Размер реального Kyber-768 публичного ключа (FIPS 203)
     KYBER768_PUB_SIZE = 1184
-    # Размер реального Kyber-768 шифротекста
     KYBER768_CT_SIZE = 1088
-    # Размер эмулированного ключа / шифротекста (X25519)
     EMULATED_SIZE = 32
 
     @staticmethod
@@ -181,7 +172,7 @@ class KyberKeyPair:
         """
         Инкапсуляция: создать общий секрет и шифротекст для получателя.
 
-        Fix #1: при несовместимости режимов (реальный Kyber ↔ эмуляция)
+        При несовместимости режимов (реальный Kyber ↔ эмуляция)
         выбрасывает HandshakeError — молчаливой деградации больше нет.
 
         Args:
@@ -212,8 +203,6 @@ class KyberKeyPair:
             ciphertext = ephemeral.serialize_public()  # 32 bytes
             return shared_secret, ciphertext
 
-        # Fix #1: несовместимость режимов — жёсткий отказ
-        # (ранее возвращался KYBER_NULL_SECRET, что тихо деградировало до X25519-only).
         raise HandshakeError(
             "Несовместимость Kyber-режимов: один пир использует реальный ML-KEM, "
             "другой — X25519-эмуляцию. Handshake отклонён для сохранения "
@@ -224,7 +213,7 @@ class KyberKeyPair:
         """
         Декапсуляция: извлечь общий секрет из шифротекста.
 
-        Fix #1: при несовместимости режимов выбрасывает HandshakeError.
+        При несовместимости режимов выбрасывает HandshakeError.
 
         Args:
             ciphertext: Полученный шифротекст от отправителя.
@@ -236,7 +225,6 @@ class KyberKeyPair:
             HandshakeError: Если режимы Kyber несовместимы.
         """
         if len(ciphertext) == 0:
-            # Fix #1: пустой шифротекст — признак несовместимости, жёсткий отказ
             raise HandshakeError(
                 "Получен пустой Kyber-шифротекст: пир не поддерживает liboqs. "
                 "Handshake отклонён."
@@ -258,7 +246,6 @@ class KyberKeyPair:
                 raw_secret + b"kyber-768-emulation"
             ).digest()
 
-        # Fix #1: несовместимость — жёсткий отказ
         raise HandshakeError(
             f"Несовместимость Kyber-режимов при декапсуляции "
             f"(ciphertext={len(ciphertext)} байт, own_real={self._is_real_kyber}). "

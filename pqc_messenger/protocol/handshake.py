@@ -95,7 +95,7 @@ class Handshake:
     """
     Менеджер гибридного Handshake.
 
-    Fix #3: process_init требует явный список доверенных контактов.
+    process_init требует явный список доверенных контактов.
     """
 
     @staticmethod
@@ -134,12 +134,12 @@ class Handshake:
     def process_init(
         responder: IdentityKeyBundle,
         init_msg: HandshakeInitMessage,
-        trusted_contact_ids: set[str],   # Fix #3: обязательный параметр
+        trusted_contact_ids: set[str],
     ) -> tuple[HandshakeRespMessage, bytes]:
         """
         Обработать HANDSHAKE_INIT и создать HANDSHAKE_RESP (сторона респондента).
 
-        Fix #3: проверяет, что fingerprint инициатора входит в trusted_contact_ids.
+        Проверяет, что fingerprint инициатора входит в trusted_contact_ids.
         При неизвестном инициаторе выбрасывает UnknownPeerError — без раскрытия
         конкретной причины отказа (защита от fingerprinting атак).
 
@@ -155,15 +155,12 @@ class Handshake:
             UnknownPeerError: Инициатор не в списке доверенных.
             HandshakeError: Ошибка протокола.
         """
-        # Fix #3: проверяем инициатора ДО любой криптографической обработки.
-        # Используем Identity.compute_id — тот же расчёт, что и при добавлении контакта.
         initiator_id = Identity.compute_id(
             init_msg.initiator_x25519_pub,
             init_msg.initiator_kyber_pub,
         )
         if initiator_id not in trusted_contact_ids:
-            # Не раскрываем, найден ли контакт в базе или нет.
-            # Логируем только для администратора, не для клиента.
+
             logger.warning(
                 "Handshake отклонён: неизвестный инициатор %s...",
                 initiator_id[:16],
@@ -173,7 +170,6 @@ class Handshake:
             )
 
         try:
-            # 1. Декапсуляция входящего гибридного KEM
             initiator_shared = HybridKEM.decapsulate(
                 recipient_x25519=responder.x25519,
                 recipient_kyber=responder.kyber,
@@ -181,20 +177,17 @@ class Handshake:
                 kyber_ciphertext=init_msg.kyber_ciphertext,
             )
 
-            # 2. Обратная инкапсуляция для инициатора
             resp_encap = HybridKEM.encapsulate(
                 sender_x25519=responder.x25519,
                 recipient_x25519_pub=init_msg.initiator_x25519_pub,
                 recipient_kyber_pub=init_msg.initiator_kyber_pub,
             )
 
-            # 3. Финальный общий секрет
             final_secret = KDF.derive(
                 input_key=initiator_shared + resp_encap.shared_secret,
                 info=HKDF_INFO_HANDSHAKE,
             )
 
-            # 4. Зашифрованное подтверждение
             ack_data = b"HANDSHAKE_ACK_OK"
             encrypted_ack = AEAD.encrypt(final_secret, ack_data)
 

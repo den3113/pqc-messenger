@@ -1,9 +1,8 @@
 """
 SQLite база данных для хранения контактов, сообщений и сессий.
 
-Пункт 3: автоматическое ограничение размера — при превышении
-DB_MAX_MESSAGES_PER_CONTACT или DB_MAX_TOTAL_MESSAGES старые
-сообщения удаляются, оставляя DB_PRUNE_KEEP последних.
+При превышении лимитов сообщений старые
+сообщения удаляются автоматически.
 """
 
 from __future__ import annotations
@@ -104,7 +103,7 @@ class Database:
             raise DatabaseError("База данных не инициализирована")
         return self._conn
 
-    # ── Контакты ──────────────────────────────────────────────────────────────
+
 
     def add_contact(
         self,
@@ -152,13 +151,12 @@ class Database:
         return [Contact(*row) for row in rows]
 
     def delete_contact(self, contact_id: str) -> None:
-        """Пункт 7: удалить контакт и все связанные данные."""
         conn = self._ensure_connection()
         conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
         conn.commit()
         logger.info("Контакт удалён: %s...", contact_id[:16])
 
-    # ── Сообщения ─────────────────────────────────────────────────────────────
+
 
     def store_message(
         self,
@@ -176,7 +174,6 @@ class Database:
             conn.commit()
             msg_id = cursor.lastrowid or 0
 
-            # Пункт 3: проверяем лимиты и при необходимости чистим
             self._prune_messages_if_needed(contact_id)
 
             return msg_id
@@ -185,15 +182,15 @@ class Database:
 
     def _prune_messages_if_needed(self, contact_id: str) -> None:
         """
-        Пункт 3: Удалить старые сообщения если превышен лимит.
+        Удалить старые сообщения если превышен лимит.
 
         Проверяем два лимита:
-        - DB_MAX_MESSAGES_PER_CONTACT — на конкретный контакт
-        - DB_MAX_TOTAL_MESSAGES       — суммарно по всей БД
+        - DB_MAX_MESSAGES_PER_CONTACT
+        - DB_MAX_TOTAL_MESSAGES
         """
         conn = self._ensure_connection()
 
-        # Лимит на контакт
+
         (count_contact,) = conn.execute(
             "SELECT COUNT(*) FROM messages WHERE contact_id = ?",
             (contact_id,),
@@ -214,7 +211,7 @@ class Database:
                 to_delete, contact_id[:16],
             )
 
-        # Суммарный лимит
+
         (count_total,) = conn.execute(
             "SELECT COUNT(*) FROM messages"
         ).fetchone()
@@ -264,7 +261,7 @@ class Database:
         conn.commit()
         return cursor.rowcount
 
-    # ── Сессии ────────────────────────────────────────────────────────────────
+
 
     def store_session(
         self,
@@ -304,7 +301,7 @@ class Database:
 
     def delete_expired_sessions(self, ttl: float) -> int:
         """
-        Пункт 4: удалить сессии старше ttl секунд.
+        Удалить сессии старше ttl секунд.
         Возвращает количество удалённых записей.
         """
         conn  = self._ensure_connection()
@@ -318,7 +315,7 @@ class Database:
             logger.info("Удалено %d истёкших сессий", n)
         return n
 
-    # ── Очистка ───────────────────────────────────────────────────────────────
+
 
     def wipe_all(self) -> None:
         conn = self._ensure_connection()

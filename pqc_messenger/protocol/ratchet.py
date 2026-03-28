@@ -20,7 +20,7 @@ from pqc_messenger.common.constants import (
     HKDF_INFO_MESSAGE,
     HKDF_INFO_RATCHET,
     MAX_SKIP,
-    MAX_SKIPPED_KEYS_TOTAL,  # Fix #2
+    MAX_SKIPPED_KEYS_TOTAL,
 )
 from pqc_messenger.common.exceptions import CryptoError, KeyExpiredError, ProtocolError
 from pqc_messenger.common.logging import get_logger
@@ -61,7 +61,7 @@ class SymmetricRatchet:
 
 class _BoundedSkippedKeys:
     """
-    Fix #2: OrderedDict с ограниченным числом записей.
+    OrderedDict с ограниченным числом записей.
 
     При добавлении новой записи сверх лимита вытесняется самая старая.
     Сериализуется/десериализуется как обычный словарь для совместимости.
@@ -129,7 +129,7 @@ class SessionRatchet:
     """
     Полный Double Ratchet с DH и Symmetric компонентами.
 
-    Fix #2: skipped_keys использует _BoundedSkippedKeys вместо обычного dict.
+    skipped_keys использует _BoundedSkippedKeys вместо обычного dict.
     """
 
     root_key: bytes
@@ -139,7 +139,7 @@ class SessionRatchet:
     remote_dh_public: bytes | None = None
     send_count: int = 0
     recv_count: int = 0
-    # Fix #2: ограниченный кэш вместо dict
+
     skipped_keys: _BoundedSkippedKeys = field(default_factory=_BoundedSkippedKeys)
 
     @classmethod
@@ -298,7 +298,7 @@ class SessionRatchet:
         """
         Кешировать пропущенные message keys.
 
-        Fix #2: _BoundedSkippedKeys автоматически вытесняет старые записи
+        _BoundedSkippedKeys автоматически вытесняет старые записи
         при превышении MAX_SKIPPED_KEYS_TOTAL.
         """
         if self.receiving_chain is None:
@@ -351,7 +351,7 @@ class SessionRatchet:
             ),
             "send_count": self.send_count,
             "recv_count": self.recv_count,
-            # Fix #2: используем метод to_dict() ограниченного кэша
+
             "skipped_keys": self.skipped_keys.to_dict(),
         }
         return json.dumps(state).encode("utf-8")
@@ -381,7 +381,7 @@ class SessionRatchet:
         ratchet.send_count = state["send_count"]
         ratchet.recv_count = state["recv_count"]
 
-        # Fix #2: восстанавливаем через _BoundedSkippedKeys.from_dict()
+
         ratchet.skipped_keys = _BoundedSkippedKeys.from_dict(
             state.get("skipped_keys", {})
         )

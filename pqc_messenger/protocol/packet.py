@@ -18,8 +18,8 @@
 Заголовок НЕ зашифрован, но используется как AAD при шифровании payload,
 что гарантирует его целостность.
 
-Fix #4: validate_timestamp() проверяет свежесть пакета.
-Fix #13: version_check() отклоняет неизвестные версии протокола.
+validate_timestamp() проверяет свежесть пакета.
+version_check() отклоняет неизвестные версии протокола.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from enum import IntEnum
 from dataclasses import dataclass, field
 
 from pqc_messenger.common.constants import (
-    PACKET_TIMESTAMP_TOLERANCE_SEC,   # Fix #4
+    PACKET_TIMESTAMP_TOLERANCE_SEC,
     PROTOCOL_VERSION,
 )
 from pqc_messenger.common.exceptions import PacketError, PacketReplayError
@@ -88,7 +88,7 @@ class Packet:
         tolerance: int = PACKET_TIMESTAMP_TOLERANCE_SEC,
     ) -> None:
         """
-        Fix #4: проверить свежесть временной метки пакета.
+        Проверить свежесть временной метки пакета.
 
         Отклоняет пакеты, временная метка которых отличается от текущего
         времени более чем на ±tolerance секунд.  Это защищает от replay-атак
@@ -130,7 +130,7 @@ class Packet:
         """
         Десериализовать пакет из байтовой последовательности.
 
-        Fix #13: отклоняет пакеты с версией, отличной от PROTOCOL_VERSION,
+        Отклоняет пакеты с версией, отличной от PROTOCOL_VERSION,
                  и возвращает осмысленный код ошибки.
 
         Args:
@@ -153,7 +153,7 @@ class Packet:
                 HEADER_FORMAT, data[:HEADER_SIZE]
             )
 
-            # Fix #13: явная проверка версии с понятным сообщением
+
             if version != PROTOCOL_VERSION:
                 raise PacketError(
                     f"Неподдерживаемая версия протокола: {version}. "

@@ -1,12 +1,9 @@
 """
 Relay Server — «слепой» ретранслятор сообщений с rate limiting.
 
-Fix #5: rate limiting теперь привязан к IP-адресу TCP-соединения,
-        а не к самосообщаемому sender_hash, который клиент мог подделать.
-
-Fix #12: mailbox ограничен по числу записей от одного отправителя
-         (MAILBOX_PER_SENDER_MAX), чтобы злоумышленник не мог вытеснить
-         все легитимные сообщения жертвы до её подключения.
+Rate limiting привязан к IP-адресу TCP-соединения.
+Mailbox ограничен по числу записей от одного отправителя
+(MAILBOX_PER_SENDER_MAX).
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ from pqc_messenger.common.constants import (
     DEFAULT_RELAY_HOST,
     DEFAULT_RELAY_PORT,
     MAILBOX_MAX_SIZE,
-    MAILBOX_PER_SENDER_MAX,   # Fix #12
+    MAILBOX_PER_SENDER_MAX,
     RATE_LIMIT_MAX_MSGS,
     RATE_LIMIT_WINDOW,
     WS_MAX_MESSAGE_SIZE,
@@ -46,8 +43,7 @@ class RateLimiter:
     """
     Скользящее окно rate limiting.
 
-    Fix #5: bucket key — это IP-адрес клиента (remote_address[0]),
-            а не self-reported sender_hash, который клиент мог сфабриковать.
+    Bucket key — IP-адрес клиента (remote_address[0]).
     """
 
     def __init__(
@@ -98,8 +94,6 @@ class RelayServer:
         self.mailboxes: DefaultDict[str, asyncio.Queue] = defaultdict(
             lambda: asyncio.Queue(maxsize=MAILBOX_MAX_SIZE)
         )
-        # Fix #12: счётчик записей от каждого отправителя в каждый mailbox
-        # Структура: {recipient_hash: {sender_ip: count}}
         self._mailbox_sender_counts: DefaultDict[str, DefaultDict[str, int]] = defaultdict(
             lambda: defaultdict(int)
         )
@@ -182,7 +176,7 @@ class RelayServer:
                     await mailbox.put(queued_msg)
                     break
             if delivered:
-                # Сбрасываем счётчики отправителей для этого mailbox
+
                 self._mailbox_sender_counts.pop(sender_hash, None)
                 logger.info(
                     "Доставлено %d накопленных сообщений для %s...",
@@ -223,7 +217,7 @@ class RelayServer:
         sender_ip: str,
     ) -> None:
         """
-        Fix #12: перед добавлением проверяем лимит записей от одного отправителя.
+        Перед добавлением проверяет лимит записей от одного отправителя.
 
         Если sender_ip уже достиг MAILBOX_PER_SENDER_MAX, новое сообщение
         отбрасывается вместо вытеснения сообщений других отправителей.
@@ -245,7 +239,7 @@ class RelayServer:
             mailbox.put_nowait(message)
             sender_counts[sender_ip] = current_count + 1
         except asyncio.QueueFull:
-            # Глобальный лимит mailbox: вытесняем старейшее сообщение
+    
             logger.warning(
                 "Mailbox переполнен для %s..., удаляем старые", recipient_hash[:16]
             )
@@ -270,7 +264,7 @@ class RelayServer:
 
         logger.info("Relay Server запущен на ws://%s:%d", self.host, self.port)
         logger.info(
-            "Rate limit: %d сообщений / %d сек на IP (Fix #5: по IP, не по hash)",
+            "Rate limit: %d сообщений / %d сек на IP",
             RATE_LIMIT_MAX_MSGS, RATE_LIMIT_WINDOW,
         )
 
