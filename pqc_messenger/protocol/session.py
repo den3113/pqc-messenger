@@ -1,26 +1,26 @@
 """
 Управление криптографическими сессиями.
 
-Сессия инкапсулирует весь криптографический контекст общения
-с конкретным контактом: ratchet-состояние, ключи, метаданные.
+Fix #4: receive_message вызывает packet.validate_timestamp() перед расшифровкой.
+Fix #8: plaintext сообщений НИКОГДА не попадает в логи (документировано явно).
 """
 
 from __future__ import annotations
 
-import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from pqc_messenger.common.constants import PROTOCOL_VERSION, SESSION_TTL
-from pqc_messenger.common.exceptions import SessionError
+from pqc_messenger.common.exceptions import PacketReplayError, SessionError
 from pqc_messenger.common.logging import get_logger
-from pqc_messenger.crypto.aead import AEAD
 from pqc_messenger.crypto.identity import Identity
 from pqc_messenger.protocol.packet import Packet, PacketType
 from pqc_messenger.protocol.ratchet import SessionRatchet
 
+# Fix #8: логгер этого модуля намеренно не логирует содержимое сообщений.
+# НЕ добавляйте logger.debug(plaintext) или любой другой вывод plaintext'а —
+# log-файлы хранятся в открытом виде и не защищены мастер-ключом.
 logger = get_logger("protocol.session")
 
 
@@ -55,18 +55,7 @@ class Session:
         contact_kyber_pub: bytes,
         ratchet: SessionRatchet,
     ) -> Session:
-        """
-        Создать новую сессию после успешного Handshake.
-
-        Args:
-            contact_id: ID контакта.
-            contact_x25519_pub: X25519 публичный ключ контакта.
-            contact_kyber_pub: Kyber публичный ключ контакта.
-            ratchet: Инициализированный ratchet.
-
-        Returns:
-            Новая Session.
-        """
+        """Создать новую сессию после успешного Handshake."""
         return cls(
             session_id=str(uuid.uuid4()),
             contact_id=contact_id,
@@ -79,6 +68,8 @@ class Session:
         """
         Зашифровать и упаковать сообщение для отправки.
 
+        Fix #8: plaintext никогда не логируется.
+
         Args:
             plaintext: Текст сообщения.
 
@@ -86,18 +77,15 @@ class Session:
             Packet, готовый к передаче через relay.
         """
         try:
-            # Шифруем через ratchet
             encrypted_payload = self.ratchet.encrypt(
                 plaintext.encode("utf-8")
             )
 
-            # Хеш получателя для «слепой» маршрутизации
             recipient_hash = Identity.compute_hash(
                 self.contact_x25519_pub,
                 self.contact_kyber_pub,
             )
 
-            # Создаём пакет
             packet = Packet(
                 packet_type=PacketType.MESSAGE,
                 recipient_hash=recipient_hash,
@@ -105,7 +93,9 @@ class Session:
             )
 
             self.last_activity = time.time()
-            logger.debug(f"Сообщение зашифровано для сессии {self.session_id[:8]}")
+            # Fix #8: логируем только метаданные (ID сессии, тип),
+            # но НИКОГДА не содержимое сообщения.
+            logger.debug("Сообщение зашифровано (сессия %s)", self.session_id[:8])
             return packet
 
         except Exception as e:
@@ -115,46 +105,49 @@ class Session:
         """
         Расшифровать входящее сообщение.
 
+        Fix #4: перед расшифровкой проверяет свежесть временной метки пакета.
+        Fix #8: расшифрованный plaintext никогда не логируется.
+
         Args:
             packet: Полученный Packet с типом MESSAGE.
 
         Returns:
             Расшифрованный текст сообщения.
+
+        Raises:
+            PacketReplayError: Если пакет устарел (Fix #4).
+            SessionError: При других ошибках расшифровки.
         """
         if packet.packet_type != PacketType.MESSAGE:
             raise SessionError(
                 f"Ожидался пакет MESSAGE, получен {packet.packet_type.name}"
             )
 
+        # Fix #4: проверяем свежесть пакета до любой криптографической работы.
+        # PacketReplayError пробрасывается без оборачивания в SessionError,
+        # чтобы вызывающий код мог различить replay и другие ошибки.
+        packet.validate_timestamp()
+
         try:
             plaintext_bytes = self.ratchet.decrypt(packet.payload)
             self.last_activity = time.time()
-            logger.debug(f"Сообщение расшифровано в сессии {self.session_id[:8]}")
+            # Fix #8: только метаданные в лог, plaintext — никогда.
+            logger.debug("Сообщение расшифровано (сессия %s)", self.session_id[:8])
             return plaintext_bytes.decode("utf-8")
 
+        except PacketReplayError:
+            raise
         except Exception as e:
-            raise SessionError(f"Ошибка расшифрования сообщения: {e}") from e
+            raise SessionError(f"Ошибка расшифровки сообщения: {e}") from e
 
     def is_expired(self) -> bool:
-        """
-        Проверить, истекла ли сессия.
-
-        Returns:
-            True, если сессия неактивна дольше SESSION_TTL.
-        """
+        """Проверить, истекла ли сессия."""
         return (time.time() - self.last_activity) > SESSION_TTL
 
     def destroy(self) -> None:
-        """
-        Безопасно уничтожить сессию.
+        """Безопасно уничтожить сессию (обнулить ключи)."""
+        logger.info("Уничтожение сессии %s", self.session_id[:8])
 
-        Обнуляет все криптографические ключи в памяти.
-        Полноценное удаление из памяти невозможно в Python,
-        но обнуление переменных минимизирует окно уязвимости.
-        """
-        logger.info(f"Уничтожение сессии {self.session_id[:8]}")
-
-        # Обнуление ключей
         self.ratchet.root_key = b"\x00" * len(self.ratchet.root_key)
         if self.ratchet.sending_chain:
             self.ratchet.sending_chain.chain_key = b"\x00" * 32

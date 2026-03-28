@@ -1,8 +1,9 @@
 """
 Зашифрованное хранилище ключей.
 
-Пункт 6: мастер-ключ больше не доступен напрямую снаружи.
-Вместо _master_key используется метод encrypt_for_storage() / decrypt_from_storage().
+Fix #6: при инициализации устанавливается wal_autocheckpoint=100,
+        при закрытии выполняется PRAGMA wal_checkpoint(TRUNCATE),
+        чтобы WAL-файл не хранил данные дольше необходимого.
 """
 
 from __future__ import annotations
@@ -11,7 +12,11 @@ import json
 import os
 import sqlite3
 
-from pqc_messenger.common.constants import DEFAULT_DATA_DIR, KEYSTORE_FILENAME
+from pqc_messenger.common.constants import (
+    DEFAULT_DATA_DIR,
+    KEYSTORE_FILENAME,
+    KEYSTORE_WAL_AUTOCHECKPOINT,   # Fix #6
+)
 from pqc_messenger.common.exceptions import CryptoError, StorageError
 from pqc_messenger.common.logging import get_logger
 from pqc_messenger.crypto.aead import AEAD
@@ -26,8 +31,6 @@ class KeyStore:
     Зашифрованное хранилище приватных ключей.
 
     Публичный API не раскрывает мастер-ключ напрямую.
-    Для шифрования/расшифровки данных приложения используйте
-    encrypt_for_storage() и decrypt_from_storage().
     """
 
     def __init__(self, data_dir: str | None = None) -> None:
@@ -35,7 +38,7 @@ class KeyStore:
             data_dir = os.path.join(os.path.expanduser("~"), DEFAULT_DATA_DIR)
         self._data_dir  = data_dir
         self._ks_path   = os.path.join(data_dir, KEYSTORE_FILENAME)
-        self.__master_key: bytes | None = None   # двойное подчёркивание = name mangling
+        self.__master_key: bytes | None = None
         self._conn: sqlite3.Connection | None = None
 
     # ── Инициализация ─────────────────────────────────────────────────────────
@@ -43,6 +46,9 @@ class KeyStore:
     def initialize(self, password: str) -> bool:
         """
         Инициализировать хранилище.
+
+        Fix #6: устанавливает wal_autocheckpoint=100, чтобы WAL-файл
+                усекался чаще и не хранил лишние зашифрованные блоки.
 
         Returns:
             True — создано новое хранилище.
@@ -57,6 +63,10 @@ class KeyStore:
 
         self._conn = sqlite3.connect(self._ks_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Fix #6: уменьшаем порог авточекпойнта до 100 страниц
+        self._conn.execute(
+            f"PRAGMA wal_autocheckpoint={KEYSTORE_WAL_AUTOCHECKPOINT}"
+        )
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS keystore (
                 key   TEXT PRIMARY KEY,
@@ -74,7 +84,6 @@ class KeyStore:
             logger.info("Новое хранилище ключей создано")
             return True
 
-        # Разблокировка существующего
         salt = self._get("argon2_salt")
         if salt is None:
             raise StorageError("Повреждённое хранилище: отсутствует соль")
@@ -85,18 +94,14 @@ class KeyStore:
         if verification is None:
             raise StorageError("Повреждённое хранилище: отсутствует контрольная запись")
 
-        # Пункт 2: явно различаем неверный пароль и повреждённые данные
         try:
             result = AEAD.decrypt(master_key, verification)
         except Exception:
-            raise CryptoError(
-                "Неверный пароль. Проверьте правильность ввода."
-            )
+            raise CryptoError("Неверный пароль. Проверьте правильность ввода.")
 
         if result != b"PQC_KEYSTORE_OK":
             raise StorageError(
-                "Хранилище повреждено: контрольная запись не совпадает. "
-                "Возможно, файл был изменён вручную."
+                "Хранилище повреждено: контрольная запись не совпадает."
             )
 
         self.__master_key = master_key
@@ -105,27 +110,18 @@ class KeyStore:
 
     @property
     def is_unlocked(self) -> bool:
-        """Проверить, разблокировано ли хранилище."""
         return self.__master_key is not None
 
-    # ── Публичный API шифрования (пункт 6) ───────────────────────────────────
+    # ── Публичный API шифрования ──────────────────────────────────────────────
 
     def encrypt_for_storage(self, plaintext: bytes) -> bytes:
-        """
-        Зашифровать данные на мастер-ключе.
-
-        Использовать вместо прямого доступа к _master_key.
-        """
+        """Зашифровать данные на мастер-ключе."""
         if self.__master_key is None:
             raise StorageError("Хранилище не разблокировано")
         return AEAD.encrypt(self.__master_key, plaintext)
 
     def decrypt_from_storage(self, ciphertext: bytes) -> bytes:
-        """
-        Расшифровать данные зашифрованные на мастер-ключе.
-
-        Использовать вместо прямого доступа к _master_key.
-        """
+        """Расшифровать данные, зашифрованные на мастер-ключе."""
         if self.__master_key is None:
             raise StorageError("Хранилище не разблокировано")
         return AEAD.decrypt(self.__master_key, ciphertext)
@@ -183,11 +179,19 @@ class KeyStore:
         logger.warning("Все ключи удалены (WIPE)")
 
     def close(self) -> None:
+        """
+        Fix #6: перед закрытием выполняем TRUNCATE-чекпойнт,
+                чтобы WAL-файл усекался и не хранил лишних данных на диске.
+        """
         if self.__master_key:
-            # Обнуляем мастер-ключ в памяти
             self.__master_key = b"\x00" * len(self.__master_key)
             self.__master_key = None
         if self._conn:
+            try:
+                # Fix #6: принудительный TRUNCATE checkpoint
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as e:
+                logger.warning("Не удалось выполнить WAL checkpoint: %s", e)
             self._conn.close()
             self._conn = None
 

@@ -1,24 +1,29 @@
 """
 Relay Server — «слепой» ретранслятор сообщений с rate limiting.
 
-Пункт 5: каждый клиент ограничен RATE_LIMIT_MAX_MSGS сообщениями
-за RATE_LIMIT_WINDOW секунд. При превышении — пакет отбрасывается
-с ответом ERROR (без блокировки соединения).
+Fix #5: rate limiting теперь привязан к IP-адресу TCP-соединения,
+        а не к самосообщаемому sender_hash, который клиент мог подделать.
+
+Fix #12: mailbox ограничен по числу записей от одного отправителя
+         (MAILBOX_PER_SENDER_MAX), чтобы злоумышленник не мог вытеснить
+         все легитимные сообщения жертвы до её подключения.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
 import sys
 import time
+import argparse
 from collections import defaultdict, deque
+from typing import DefaultDict
 
 from pqc_messenger.common.constants import (
     DEFAULT_RELAY_HOST,
     DEFAULT_RELAY_PORT,
     MAILBOX_MAX_SIZE,
+    MAILBOX_PER_SENDER_MAX,   # Fix #12
     RATE_LIMIT_MAX_MSGS,
     RATE_LIMIT_WINDOW,
     WS_MAX_MESSAGE_SIZE,
@@ -39,10 +44,10 @@ except ImportError:
 
 class RateLimiter:
     """
-    Пункт 5: скользящее окно rate limiting на отправку SEND-пакетов.
+    Скользящее окно rate limiting.
 
-    Хранит timestamp'ы последних сообщений для каждого hash-клиента.
-    Старые записи вытесняются автоматически при проверке.
+    Fix #5: bucket key — это IP-адрес клиента (remote_address[0]),
+            а не self-reported sender_hash, который клиент мог сфабриковать.
     """
 
     def __init__(
@@ -52,15 +57,17 @@ class RateLimiter:
     ) -> None:
         self._window   = window
         self._max_msgs = max_msgs
-        # hash → deque of timestamps
-        self._buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._buckets: DefaultDict[str, deque[float]] = defaultdict(deque)
 
-    def is_allowed(self, client_id: str) -> bool:
-        """Вернуть True если клиент не превысил лимит, иначе False."""
+    def is_allowed(self, client_ip: str) -> bool:
+        """
+        Вернуть True если IP не превысил лимит, иначе False.
+
+        Fix #5: принимает IP-адрес, а не sender_hash.
+        """
         now    = time.monotonic()
-        bucket = self._buckets[client_id]
+        bucket = self._buckets[client_ip]
 
-        # Выбрасываем устаревшие записи
         cutoff = now - self._window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
@@ -72,14 +79,13 @@ class RateLimiter:
         return True
 
     def cleanup(self) -> None:
-        """Удалить пустые корзины (вызывать периодически)."""
         empty = [k for k, v in self._buckets.items() if not v]
         for k in empty:
             del self._buckets[k]
 
 
 class RelayServer:
-    """«Слепой» Relay-сервер с Mailbox и rate limiting."""
+    """«Слепой» Relay-сервер с Mailbox, rate limiting и per-sender mailbox limit."""
 
     def __init__(
         self,
@@ -89,14 +95,27 @@ class RelayServer:
         self.host        = host
         self.port        = port
         self.connections: dict[str, ServerConnection] = {}
-        self.mailboxes: dict[str, asyncio.Queue] = defaultdict(
+        self.mailboxes: DefaultDict[str, asyncio.Queue] = defaultdict(
             lambda: asyncio.Queue(maxsize=MAILBOX_MAX_SIZE)
         )
+        # Fix #12: счётчик записей от каждого отправителя в каждый mailbox
+        # Структура: {recipient_hash: {sender_ip: count}}
+        self._mailbox_sender_counts: DefaultDict[str, DefaultDict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
         self._rate_limiter = RateLimiter()
-        self._stats = {"total_messages": 0, "total_connections": 0, "rate_limited": 0}
+        self._stats = {
+            "total_messages": 0,
+            "total_connections": 0,
+            "rate_limited": 0,
+            "mailbox_sender_dropped": 0,
+        }
 
     async def handle_connection(self, websocket: ServerConnection) -> None:
+        # Fix #5: получаем IP немедленно — он не изменится за время соединения
+        client_ip: str = websocket.remote_address[0]
         client_hash: str | None = None
+
         try:
             async for raw_message in websocket:
                 if isinstance(raw_message, bytes):
@@ -114,27 +133,24 @@ class RelayServer:
                         websocket, msg.sender_hash
                     )
                 elif msg.type == MessageType.SEND:
-                    # Пункт 5: rate limit по hash отправителя
-                    sender_id = client_hash or websocket.remote_address[0]
-                    if not self._rate_limiter.is_allowed(sender_id):
+                    # Fix #5: rate limit по IP-адресу, не по sender_hash
+                    if not self._rate_limiter.is_allowed(client_ip):
                         self._stats["rate_limited"] += 1
-                        logger.warning(
-                            "Rate limit превышен для %s", sender_id[:16] if len(sender_id) > 16 else sender_id
-                        )
+                        logger.warning("Rate limit превышен для IP %s", client_ip)
                         await websocket.send(
                             RelayMessage.create_error(
                                 "Слишком много сообщений. Подождите немного."
                             ).to_json()
                         )
                         continue
-                    await self._handle_send(msg)
+                    await self._handle_send(msg, sender_ip=client_ip)
                 elif msg.type == MessageType.PING:
                     await websocket.send(RelayMessage(type=MessageType.PONG).to_json())
                 elif msg.type == MessageType.UNREGISTER:
                     break
 
         except websockets.exceptions.ConnectionClosed:  # type: ignore[union-attr]
-            logger.debug("Клиент отключился: %s", client_hash or "unknown")
+            logger.debug("Клиент отключился: %s", client_hash or client_ip)
         finally:
             if client_hash and client_hash in self.connections:
                 del self.connections[client_hash]
@@ -152,10 +168,8 @@ class RelayServer:
             sender_hash[:16], len(self.connections),
         )
 
-        # ACK — ОБЯЗАТЕЛЬНО до mailbox (иначе клиент получит DELIVER раньше ACK)
         await websocket.send(RelayMessage.ack("register").to_json())
 
-        # Доставить накопленные сообщения
         if sender_hash in self.mailboxes:
             mailbox   = self.mailboxes[sender_hash]
             delivered = 0
@@ -168,6 +182,8 @@ class RelayServer:
                     await mailbox.put(queued_msg)
                     break
             if delivered:
+                # Сбрасываем счётчики отправителей для этого mailbox
+                self._mailbox_sender_counts.pop(sender_hash, None)
                 logger.info(
                     "Доставлено %d накопленных сообщений для %s...",
                     delivered, sender_hash[:16],
@@ -175,7 +191,7 @@ class RelayServer:
 
         return sender_hash
 
-    async def _handle_send(self, msg: RelayMessage) -> None:
+    async def _handle_send(self, msg: RelayMessage, sender_ip: str) -> None:
         self._stats["total_messages"] += 1
         recipient_hash = msg.recipient_hash
 
@@ -195,27 +211,54 @@ class RelayServer:
                     "Ошибка доставки, кладём в mailbox: %s...", recipient_hash[:16]
                 )
                 del self.connections[recipient_hash]
-                await self._enqueue_to_mailbox(recipient_hash, deliver_json)
+                await self._enqueue_to_mailbox(recipient_hash, deliver_json, sender_ip)
         else:
-            await self._enqueue_to_mailbox(recipient_hash, deliver_json)
+            await self._enqueue_to_mailbox(recipient_hash, deliver_json, sender_ip)
             logger.debug("Пакет в mailbox: → %s...", recipient_hash[:16])
 
-    async def _enqueue_to_mailbox(self, recipient_hash: str, message: str) -> None:
+    async def _enqueue_to_mailbox(
+        self,
+        recipient_hash: str,
+        message: str,
+        sender_ip: str,
+    ) -> None:
+        """
+        Fix #12: перед добавлением проверяем лимит записей от одного отправителя.
+
+        Если sender_ip уже достиг MAILBOX_PER_SENDER_MAX, новое сообщение
+        отбрасывается вместо вытеснения сообщений других отправителей.
+        Это не позволяет одному IP занять весь mailbox жертвы.
+        """
+        sender_counts = self._mailbox_sender_counts[recipient_hash]
+        current_count = sender_counts.get(sender_ip, 0)
+
+        if current_count >= MAILBOX_PER_SENDER_MAX:
+            self._stats["mailbox_sender_dropped"] += 1
+            logger.warning(
+                "Mailbox для %s...: лимит от отправителя %s достигнут (%d), пакет отброшен",
+                recipient_hash[:16], sender_ip, MAILBOX_PER_SENDER_MAX,
+            )
+            return
+
         mailbox = self.mailboxes[recipient_hash]
         try:
             mailbox.put_nowait(message)
+            sender_counts[sender_ip] = current_count + 1
         except asyncio.QueueFull:
+            # Глобальный лимит mailbox: вытесняем старейшее сообщение
             logger.warning(
                 "Mailbox переполнен для %s..., удаляем старые", recipient_hash[:16]
             )
             try:
                 mailbox.get_nowait()
+                # При вытеснении не корректируем sender_counts точно —
+                # это усложнило бы логику; небольшое приближение допустимо.
             except asyncio.QueueEmpty:
                 pass
             mailbox.put_nowait(message)
+            sender_counts[sender_ip] = current_count + 1
 
     async def _cleanup_loop(self) -> None:
-        """Периодически очищаем rate limiter от пустых корзин."""
         while True:
             await asyncio.sleep(300)
             self._rate_limiter.cleanup()
@@ -227,7 +270,7 @@ class RelayServer:
 
         logger.info("Relay Server запущен на ws://%s:%d", self.host, self.port)
         logger.info(
-            "Rate limit: %d сообщений / %d сек на клиента",
+            "Rate limit: %d сообщений / %d сек на IP (Fix #5: по IP, не по hash)",
             RATE_LIMIT_MAX_MSGS, RATE_LIMIT_WINDOW,
         )
 

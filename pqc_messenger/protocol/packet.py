@@ -17,6 +17,9 @@
 
 Заголовок НЕ зашифрован, но используется как AAD при шифровании payload,
 что гарантирует его целостность.
+
+Fix #4: validate_timestamp() проверяет свежесть пакета.
+Fix #13: version_check() отклоняет неизвестные версии протокола.
 """
 
 from __future__ import annotations
@@ -26,17 +29,18 @@ import time
 from enum import IntEnum
 from dataclasses import dataclass, field
 
-from pqc_messenger.common.constants import PROTOCOL_VERSION
-from pqc_messenger.common.exceptions import PacketError
+from pqc_messenger.common.constants import (
+    PACKET_TIMESTAMP_TOLERANCE_SEC,   # Fix #4
+    PROTOCOL_VERSION,
+)
+from pqc_messenger.common.exceptions import PacketError, PacketReplayError
 from pqc_messenger.common.logging import get_logger
 
 logger = get_logger("protocol.packet")
 
-# Формат заголовка: version(1) + type(1) + recipient_hash(32) + timestamp(8) = 42 байта
 HEADER_FORMAT = "!BB32sQ"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 42
 
-# Формат длины payload
 PAYLOAD_LEN_FORMAT = "!I"
 PAYLOAD_LEN_SIZE = struct.calcsize(PAYLOAD_LEN_FORMAT)  # 4
 
@@ -44,12 +48,12 @@ PAYLOAD_LEN_SIZE = struct.calcsize(PAYLOAD_LEN_FORMAT)  # 4
 class PacketType(IntEnum):
     """Типы пакетов протокола."""
 
-    HANDSHAKE_INIT = 0x01   # Инициация Handshake
-    HANDSHAKE_RESP = 0x02   # Ответ на Handshake
-    MESSAGE = 0x10          # Зашифрованное сообщение
-    ACK = 0x20              # Подтверждение доставки
-    CONTROL = 0x30          # Управляющие команды (удаление, уведомления)
-    KEY_ROTATION = 0x40     # Ротация DH ключа (ratchet step)
+    HANDSHAKE_INIT = 0x01
+    HANDSHAKE_RESP = 0x02
+    MESSAGE        = 0x10
+    ACK            = 0x20
+    CONTROL        = 0x30
+    KEY_ROTATION   = 0x40
 
 
 @dataclass
@@ -57,13 +61,9 @@ class Packet:
     """
     Сетевой пакет PQC-Messenger.
 
-    Атрибуты:
-        version: Версия протокола.
-        packet_type: Тип пакета.
-        recipient_hash: SHA-256 хеш публичного ключа получателя (32 байта).
-                         Используется relay-сервером для «слепой» маршрутизации.
-        timestamp: Unix-время создания пакета.
-        payload: Зашифрованная нагрузка (nonce + ciphertext + tag).
+    Fix #4: метод validate_timestamp() проверяет, что временная метка
+            пакета не слишком далеко отстоит от текущего времени.
+    Fix #13: deserialize() отклоняет пакеты с неизвестной версией протокола.
     """
 
     packet_type: PacketType
@@ -73,7 +73,6 @@ class Packet:
     timestamp: int = field(default_factory=lambda: int(time.time()))
 
     def __post_init__(self) -> None:
-        """Валидация полей после инициализации."""
         if len(self.recipient_hash) != 32:
             raise PacketError(
                 f"recipient_hash должен быть 32 байта, получено {len(self.recipient_hash)}"
@@ -84,12 +83,34 @@ class Packet:
             except ValueError as e:
                 raise PacketError(f"Неизвестный тип пакета: {self.packet_type}") from e
 
-    def header_bytes(self) -> bytes:
+    def validate_timestamp(
+        self,
+        tolerance: int = PACKET_TIMESTAMP_TOLERANCE_SEC,
+    ) -> None:
         """
-        Сериализовать заголовок пакета.
+        Fix #4: проверить свежесть временной метки пакета.
 
-        Используется как AAD при шифровании/расшифровании payload.
+        Отклоняет пакеты, временная метка которых отличается от текущего
+        времени более чем на ±tolerance секунд.  Это защищает от replay-атак
+        (злоумышленник не может переотправить захваченный пакет спустя время).
+
+        Args:
+            tolerance: Максимально допустимое отклонение в секундах.
+
+        Raises:
+            PacketReplayError: Если метка слишком старая или из будущего.
         """
+        now  = int(time.time())
+        diff = abs(now - self.timestamp)
+        if diff > tolerance:
+            raise PacketReplayError(
+                f"Пакет отклонён: временная метка {self.timestamp} "
+                f"отличается от текущего времени {now} на {diff}с "
+                f"(максимум {tolerance}с). Возможен replay-attack."
+            )
+
+    def header_bytes(self) -> bytes:
+        """Сериализовать заголовок пакета (используется как AAD)."""
         return struct.pack(
             HEADER_FORMAT,
             self.version,
@@ -99,13 +120,8 @@ class Packet:
         )
 
     def serialize(self) -> bytes:
-        """
-        Сериализовать весь пакет в байты для передачи по сети.
-
-        Returns:
-            Байтовое представление пакета.
-        """
-        header = self.header_bytes()
+        """Сериализовать весь пакет в байты для передачи по сети."""
+        header      = self.header_bytes()
         payload_len = struct.pack(PAYLOAD_LEN_FORMAT, len(self.payload))
         return header + payload_len + self.payload
 
@@ -114,6 +130,9 @@ class Packet:
         """
         Десериализовать пакет из байтовой последовательности.
 
+        Fix #13: отклоняет пакеты с версией, отличной от PROTOCOL_VERSION,
+                 и возвращает осмысленный код ошибки.
+
         Args:
             data: Сырые байты пакета.
 
@@ -121,7 +140,7 @@ class Packet:
             Объект Packet.
 
         Raises:
-            PacketError: При ошибке разбора.
+            PacketError: При ошибке разбора или неизвестной версии.
         """
         min_size = HEADER_SIZE + PAYLOAD_LEN_SIZE
         if len(data) < min_size:
@@ -130,16 +149,21 @@ class Packet:
             )
 
         try:
-            # Разбор заголовка
             version, ptype, recipient_hash, timestamp = struct.unpack(
                 HEADER_FORMAT, data[:HEADER_SIZE]
             )
 
-            # Разбор длины payload
+            # Fix #13: явная проверка версии с понятным сообщением
+            if version != PROTOCOL_VERSION:
+                raise PacketError(
+                    f"Неподдерживаемая версия протокола: {version}. "
+                    f"Ожидается: {PROTOCOL_VERSION}. "
+                    "Обновите клиент или сервер до совместимой версии."
+                )
+
             payload_len_data = data[HEADER_SIZE:HEADER_SIZE + PAYLOAD_LEN_SIZE]
             (payload_len,) = struct.unpack(PAYLOAD_LEN_FORMAT, payload_len_data)
 
-            # Извлечение payload
             payload_start = HEADER_SIZE + PAYLOAD_LEN_SIZE
             payload = data[payload_start:payload_start + payload_len]
 

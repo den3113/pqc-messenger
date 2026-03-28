@@ -1,19 +1,9 @@
 """
 Гибридный протокол Handshake (X25519 + Kyber-768).
 
-Последовательность:
-1. Initiator → Responder: HANDSHAKE_INIT
-   - Эфемерный X25519 публичный ключ
-   - Kyber KEM шифротекст (инкапсуляция для публичного ключа получателя)
-   - Identity публичный ключ инициатора (для идентификации)
-
-2. Responder → Initiator: HANDSHAKE_RESP
-   - Эфемерный X25519 публичный ключ респондента
-   - Kyber KEM шифротекст (инкапсуляция для публичного ключа инициатора)
-   - Зашифрованное подтверждение (на общем секрете)
-
-После Handshake обе стороны разделяют общий секрет,
-из которого деривируются сессионные ключи.
+Fix #3: process_init теперь принимает trusted_contact_ids — множество
+        разрешённых fingerprint'ов. Неизвестные инициаторы отклоняются
+        через UnknownPeerError без раскрытия причины отказа.
 """
 
 from __future__ import annotations
@@ -23,9 +13,10 @@ import os
 from dataclasses import dataclass
 
 from pqc_messenger.common.constants import HKDF_INFO_HANDSHAKE
-from pqc_messenger.common.exceptions import HandshakeError
+from pqc_messenger.common.exceptions import HandshakeError, UnknownPeerError
 from pqc_messenger.common.logging import get_logger
 from pqc_messenger.crypto.aead import AEAD
+from pqc_messenger.crypto.identity import Identity
 from pqc_messenger.crypto.kem import HybridKEM
 from pqc_messenger.crypto.kdf import KDF
 from pqc_messenger.crypto.keys import IdentityKeyBundle, KyberKeyPair, X25519KeyPair
@@ -37,13 +28,12 @@ logger = get_logger("protocol.handshake")
 class HandshakeInitMessage:
     """Данные сообщения HANDSHAKE_INIT."""
 
-    initiator_x25519_pub: bytes       # Публичный X25519 ключ инициатора (identity)
-    initiator_kyber_pub: bytes        # Публичный Kyber ключ инициатора (identity)
-    ephemeral_x25519_pub: bytes       # Эфемерный X25519 (для ECDH)
-    kyber_ciphertext: bytes           # Шифротекст Kyber KEM
+    initiator_x25519_pub: bytes
+    initiator_kyber_pub: bytes
+    ephemeral_x25519_pub: bytes
+    kyber_ciphertext: bytes
 
     def serialize(self) -> bytes:
-        """Сериализовать в JSON-совместимые байты."""
         data = {
             "ix": self.initiator_x25519_pub.hex(),
             "ik": self.initiator_kyber_pub.hex(),
@@ -54,7 +44,6 @@ class HandshakeInitMessage:
 
     @classmethod
     def deserialize(cls, raw: bytes) -> HandshakeInitMessage:
-        """Десериализовать из байтов."""
         try:
             data = json.loads(raw)
             return cls(
@@ -71,14 +60,13 @@ class HandshakeInitMessage:
 class HandshakeRespMessage:
     """Данные сообщения HANDSHAKE_RESP."""
 
-    responder_x25519_pub: bytes       # Публичный X25519 ключ респондента (identity)
-    responder_kyber_pub: bytes        # Публичный Kyber ключ респондента
-    ephemeral_x25519_pub: bytes       # Эфемерный X25519 респондента
-    kyber_ciphertext: bytes           # Шифротекст Kyber KEM для инициатора
-    encrypted_ack: bytes              # Зашифрованное подтверждение
+    responder_x25519_pub: bytes
+    responder_kyber_pub: bytes
+    ephemeral_x25519_pub: bytes
+    kyber_ciphertext: bytes
+    encrypted_ack: bytes
 
     def serialize(self) -> bytes:
-        """Сериализовать в JSON-совместимые байты."""
         data = {
             "rx": self.responder_x25519_pub.hex(),
             "rk": self.responder_kyber_pub.hex(),
@@ -90,7 +78,6 @@ class HandshakeRespMessage:
 
     @classmethod
     def deserialize(cls, raw: bytes) -> HandshakeRespMessage:
-        """Десериализовать из байтов."""
         try:
             data = json.loads(raw)
             return cls(
@@ -108,8 +95,7 @@ class Handshake:
     """
     Менеджер гибридного Handshake.
 
-    Реализует двухшаговый протокол установления сессии
-    с использованием гибридного KEM (X25519 + Kyber-768).
+    Fix #3: process_init требует явный список доверенных контактов.
     """
 
     @staticmethod
@@ -121,16 +107,10 @@ class Handshake:
         """
         Создать HANDSHAKE_INIT (сторона инициатора).
 
-        Args:
-            initiator: Ключи инициатора.
-            responder_x25519_pub: X25519 публичный ключ респондента.
-            responder_kyber_pub: Kyber публичный ключ респондента.
-
         Returns:
-            (init_message, shared_secret) — сообщение и общий секрет.
+            (init_message, shared_secret).
         """
         try:
-            # Гибридная инкапсуляция
             encap = HybridKEM.encapsulate(
                 sender_x25519=initiator.x25519,
                 recipient_x25519_pub=responder_x25519_pub,
@@ -154,17 +134,44 @@ class Handshake:
     def process_init(
         responder: IdentityKeyBundle,
         init_msg: HandshakeInitMessage,
+        trusted_contact_ids: set[str],   # Fix #3: обязательный параметр
     ) -> tuple[HandshakeRespMessage, bytes]:
         """
         Обработать HANDSHAKE_INIT и создать HANDSHAKE_RESP (сторона респондента).
 
+        Fix #3: проверяет, что fingerprint инициатора входит в trusted_contact_ids.
+        При неизвестном инициаторе выбрасывает UnknownPeerError — без раскрытия
+        конкретной причины отказа (защита от fingerprinting атак).
+
         Args:
             responder: Ключи респондента.
             init_msg: Полученное HANDSHAKE_INIT сообщение.
+            trusted_contact_ids: Множество разрешённых fingerprint'ов контактов.
 
         Returns:
-            (resp_message, shared_secret) — ответное сообщение и общий секрет.
+            (resp_message, shared_secret).
+
+        Raises:
+            UnknownPeerError: Инициатор не в списке доверенных.
+            HandshakeError: Ошибка протокола.
         """
+        # Fix #3: проверяем инициатора ДО любой криптографической обработки.
+        # Используем Identity.compute_id — тот же расчёт, что и при добавлении контакта.
+        initiator_id = Identity.compute_id(
+            init_msg.initiator_x25519_pub,
+            init_msg.initiator_kyber_pub,
+        )
+        if initiator_id not in trusted_contact_ids:
+            # Не раскрываем, найден ли контакт в базе или нет.
+            # Логируем только для администратора, не для клиента.
+            logger.warning(
+                "Handshake отклонён: неизвестный инициатор %s...",
+                initiator_id[:16],
+            )
+            raise UnknownPeerError(
+                "Входящий handshake отклонён: инициатор не является доверенным контактом."
+            )
+
         try:
             # 1. Декапсуляция входящего гибридного KEM
             initiator_shared = HybridKEM.decapsulate(
@@ -181,7 +188,7 @@ class Handshake:
                 recipient_kyber_pub=init_msg.initiator_kyber_pub,
             )
 
-            # 3. Финальный общий секрет — комбинация обоих направлений
+            # 3. Финальный общий секрет
             final_secret = KDF.derive(
                 input_key=initiator_shared + resp_encap.shared_secret,
                 info=HKDF_INFO_HANDSHAKE,
@@ -199,10 +206,10 @@ class Handshake:
                 encrypted_ack=encrypted_ack,
             )
 
-            logger.info("HANDSHAKE_RESP создан")
+            logger.info("HANDSHAKE_RESP создан для %s...", initiator_id[:16])
             return resp_msg, final_secret
 
-        except HandshakeError:
+        except (HandshakeError, UnknownPeerError):
             raise
         except Exception as e:
             raise HandshakeError(f"Ошибка обработки HANDSHAKE_INIT: {e}") from e
@@ -216,11 +223,6 @@ class Handshake:
         """
         Завершить Handshake на стороне инициатора.
 
-        Args:
-            initiator: Ключи инициатора.
-            init_shared_secret: Общий секрет из этапа create_init.
-            resp_msg: Полученный HANDSHAKE_RESP.
-
         Returns:
             Финальный общий секрет сессии.
         """
@@ -233,7 +235,7 @@ class Handshake:
                 kyber_ciphertext=resp_msg.kyber_ciphertext,
             )
 
-            # 2. Финальный секрет (тот же, что у респондента)
+            # 2. Финальный секрет
             final_secret = KDF.derive(
                 input_key=init_shared_secret + resp_shared,
                 info=HKDF_INFO_HANDSHAKE,

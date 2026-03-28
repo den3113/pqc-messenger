@@ -6,8 +6,13 @@
 - ML-KEM (Kyber-768) — постквантовая инкапсуляция ключей (FIPS 203)
 
 ВАЖНО: В данной реализации Kyber-768 эмулируется через X25519 + HKDF,
-поскольку библиотека liboqs-python может быть недоступна.
+если библиотека liboqs-python недоступна.
 При наличии liboqs модуль автоматически переключится на реальный Kyber.
+
+Fix #1: при несовместимости Kyber-режимов (один пир использует реальный Kyber,
+        другой — эмуляцию) методы encapsulate/decapsulate выбрасывают
+        HandshakeError вместо тихой подстановки нулевого секрета.
+        Это гарантирует, что постквантовая защита не деградирует молча.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 
-from pqc_messenger.common.exceptions import CryptoError, KeyError_
+from pqc_messenger.common.exceptions import CryptoError, HandshakeError, KeyError_
 from pqc_messenger.common.logging import get_logger
 
 logger = get_logger("crypto.keys")
@@ -41,13 +46,11 @@ _PROJECT_LIB_DIR = os.path.join(
     "lib",
 )
 if os.path.isdir(_PROJECT_LIB_DIR):
-    # Добавляем lib/ в путь поиска разделяемых библиотек
     _current_ld = os.environ.get("LD_LIBRARY_PATH", "")
     if _PROJECT_LIB_DIR not in _current_ld:
         os.environ["LD_LIBRARY_PATH"] = (
             f"{_PROJECT_LIB_DIR}:{_current_ld}" if _current_ld else _PROJECT_LIB_DIR
         )
-    # Предзагрузка через ctypes для текущего процесса
     import ctypes
     import ctypes.util
     _liboqs_path = os.path.join(_PROJECT_LIB_DIR, "liboqs.so")
@@ -93,15 +96,7 @@ class X25519KeyPair:
         return cls(private_key=private, public_key=private.public_key())
 
     def shared_secret(self, peer_public: X25519PublicKey) -> bytes:
-        """
-        Вычислить общий секрет ECDH.
-
-        Args:
-            peer_public: Публичный ключ другой стороны.
-
-        Returns:
-            32 байта общего секрета.
-        """
+        """Вычислить общий секрет ECDH."""
         return self.private_key.exchange(peer_public)
 
     def serialize_public(self) -> bytes:
@@ -140,6 +135,10 @@ class KyberKeyPair:
 
     При отсутствии liboqs используется эмуляция через X25519.
     Эмуляция сохраняет интерфейс, но НЕ обеспечивает постквантовую стойкость.
+
+    Fix #1: encapsulate / decapsulate выбрасывают HandshakeError при
+    несовместимости режимов (реальный Kyber ↔ эмуляция) вместо
+    молчаливого возврата нулевого секрета.
     """
 
     private_key: bytes
@@ -159,7 +158,6 @@ class KyberKeyPair:
                 _is_real_kyber=True,
             )
         else:
-            # Эмуляция: используем X25519 как замену
             kp = X25519KeyPair.generate()
             return cls(
                 private_key=kp.serialize_private(),
@@ -173,10 +171,6 @@ class KyberKeyPair:
     KYBER768_CT_SIZE = 1088
     # Размер эмулированного ключа / шифротекста (X25519)
     EMULATED_SIZE = 32
-    # Null-секрет для случая несовместимости Kyber-режимов.
-    # Обе стороны используют этот секрет, когда Kyber-инкапсуляция
-    # невозможна (разные liboqs). Безопасность обеспечивается X25519-частью.
-    KYBER_NULL_SECRET = b"\x00" * 32
 
     @staticmethod
     def _is_real_kyber_data(data: bytes) -> bool:
@@ -187,15 +181,17 @@ class KyberKeyPair:
         """
         Инкапсуляция: создать общий секрет и шифротекст для получателя.
 
-        Автоматически определяет режим по размеру публичного ключа пира.
-        При несовместимости (нет liboqs, но пир использует реальный Kyber)
-        возвращает null-секрет — обе стороны получат одинаковый результат.
+        Fix #1: при несовместимости режимов (реальный Kyber ↔ эмуляция)
+        выбрасывает HandshakeError — молчаливой деградации больше нет.
 
         Args:
             peer_public: Публичный ключ получателя.
 
         Returns:
             (shared_secret, ciphertext) — общий секрет и шифротекст.
+
+        Raises:
+            HandshakeError: Если режимы Kyber несовместимы.
         """
         peer_is_real = self._is_real_kyber_data(peer_public)
 
@@ -205,9 +201,8 @@ class KyberKeyPair:
             ciphertext, shared_secret = kem.encap_secret(peer_public)
             return shared_secret, ciphertext
 
-        if not peer_is_real:
-            # Пир использует эмуляцию (32-байтовый X25519 ключ) —
-            # используем эмуляцию и мы, независимо от нашего liboqs
+        if not peer_is_real and not _HAS_LIBOQS:
+            # Оба используют эмуляцию
             ephemeral = X25519KeyPair.generate()
             peer_pub_key = X25519KeyPair.public_from_bytes(peer_public)
             raw_secret = ephemeral.shared_secret(peer_pub_key)
@@ -217,35 +212,35 @@ class KyberKeyPair:
             ciphertext = ephemeral.serialize_public()  # 32 bytes
             return shared_secret, ciphertext
 
-        # peer_is_real=True, но _HAS_LIBOQS=False:
-        # Пир использует реальный Kyber, а у нас нет liboqs.
-        # Возвращаем null-секрет и пустой маркер-шифротекст.
-        logger.warning(
-            "Пир использует реальный Kyber, но liboqs недоступен. "
-            "Kyber-часть используется с null-секретом."
+        # Fix #1: несовместимость режимов — жёсткий отказ
+        # (ранее возвращался KYBER_NULL_SECRET, что тихо деградировало до X25519-only).
+        raise HandshakeError(
+            "Несовместимость Kyber-режимов: один пир использует реальный ML-KEM, "
+            "другой — X25519-эмуляцию. Handshake отклонён для сохранения "
+            "постквантовой защиты. Убедитесь, что оба пира установили liboqs."
         )
-        return self.KYBER_NULL_SECRET, b""
 
     def decapsulate(self, ciphertext: bytes) -> bytes:
         """
         Декапсуляция: извлечь общий секрет из шифротекста.
 
-        При несовместимости (получен реальный Kyber-шифротекст, но нет liboqs,
-        или наоборот) возвращает null-секрет для согласованного фоллбэка.
+        Fix #1: при несовместимости режимов выбрасывает HandshakeError.
 
         Args:
             ciphertext: Полученный шифротекст от отправителя.
 
         Returns:
             32 байта общего секрета.
+
+        Raises:
+            HandshakeError: Если режимы Kyber несовместимы.
         """
         if len(ciphertext) == 0:
-            # Пустой шифротекст = маркер null-секрета от стороны без liboqs
-            logger.warning(
-                "Получен пустой Kyber шифротекст (пир без liboqs). "
-                "Используется null-секрет."
+            # Fix #1: пустой шифротекст — признак несовместимости, жёсткий отказ
+            raise HandshakeError(
+                "Получен пустой Kyber-шифротекст: пир не поддерживает liboqs. "
+                "Handshake отклонён."
             )
-            return self.KYBER_NULL_SECRET
 
         ct_is_real = self._is_real_kyber_data(ciphertext)
 
@@ -263,14 +258,12 @@ class KyberKeyPair:
                 raw_secret + b"kyber-768-emulation"
             ).digest()
 
-        # Несовместимость: один реальный, другой эмулированный
-        logger.warning(
-            f"Несовместимость Kyber-режимов "
-            f"(ciphertext={len(ciphertext)} байт, "
-            f"own_real={self._is_real_kyber}). "
-            "Используется null-секрет."
+        # Fix #1: несовместимость — жёсткий отказ
+        raise HandshakeError(
+            f"Несовместимость Kyber-режимов при декапсуляции "
+            f"(ciphertext={len(ciphertext)} байт, own_real={self._is_real_kyber}). "
+            "Handshake отклонён."
         )
-        return self.KYBER_NULL_SECRET
 
 
 # ─── Identity Key Bundle ─────────────────────────────────────────────────────
@@ -303,21 +296,12 @@ class IdentityKeyBundle:
         Вычислить отпечаток (fingerprint) идентичности.
 
         Формула: SHA-256(x25519_pub || kyber_pub), представленный как hex.
-        Используется для отображения и верификации собеседника.
-
-        Returns:
-            64-символьная hex-строка.
         """
         combined = self.x25519.serialize_public() + self.kyber.public_key
         return hashlib.sha256(combined).hexdigest()
 
     def public_bundle(self) -> dict[str, bytes]:
-        """
-        Получить только публичные ключи для передачи собеседнику.
-
-        Returns:
-            Словарь с ключами 'x25519' и 'kyber'.
-        """
+        """Получить только публичные ключи для передачи собеседнику."""
         return {
             "x25519": self.x25519.serialize_public(),
             "kyber": self.kyber.public_key,
@@ -337,9 +321,6 @@ class IdentityKeyBundle:
         """Восстановить бандл из сериализованных данных."""
         try:
             x25519 = X25519KeyPair.from_private_bytes(data["x25519_private"])
-            # Определяем, реальный ли Kyber по размеру ключей и доступности liboqs.
-            # Эмуляция использует 32-байтовые X25519 ключи,
-            # реальный Kyber-768 — 1184-byte pub / 2400-byte priv.
             kyber_pub = data["kyber_public"]
             is_real = _HAS_LIBOQS and len(kyber_pub) > 32
             kyber = KyberKeyPair(
