@@ -9,7 +9,6 @@ from __future__ import annotations
 from pqc_messenger.crypto.identity import Identity
 from pqc_messenger.storage.database import Contact
 
-
 def format_contact(contact: Contact) -> str:
     """
     Отформатировать контакт для отображения в CLI.
@@ -45,7 +44,6 @@ def format_contact_list(contacts: list[Contact]) -> str:
         lines.append(f"  {i}. {name}")
         lines.append(f"     ID: {fp}")
     return "\n".join(lines)
-
 
 def parse_public_keys(key_string: str) -> tuple[str, str]:
     """

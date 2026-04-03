@@ -54,7 +54,6 @@ HELP_TEXT = """\
   /back            Вернуться в главное меню
   всё остальное    отправляется собеседнику"""
 
-
 class TUI:
     INPUT_HEIGHT  = 3
     STATUS_HEIGHT = 1
@@ -78,11 +77,6 @@ class TUI:
 
     @staticmethod
     def _is_printable_char(ch: str) -> bool:
-        """Допустим ли символ для ввода?
-
-        Разрешены: латиница, кириллица, цифры, пунктуация и пр.
-        Запрещены: управляющие символы, эмодзи, CJK-иероглифы.
-        """
         if len(ch) != 1:
             return False
         cp = ord(ch)
@@ -143,8 +137,6 @@ class TUI:
                                       msg_h + self.STATUS_HEIGHT, 0)
         self._msg_win.scrollok(False)
 
-
-
     def add_line(self, text: str, cp: int = 0) -> None:
         for line in (textwrap.wrap(text, max(self._w - 2, 10)) or [""]):
             self._lines.append((line, cp))
@@ -163,8 +155,6 @@ class TUI:
     def add_error   (self, text: str) -> None: self.add_line(f"  ✗ {text}", self.C_ERR)
     def add_info    (self, text: str) -> None: self.add_line(f"  {text}",   self.C_DIM)
     def add_header  (self, text: str) -> None: self.add_line(text,          self.C_BOLD)
-
-
 
     def _draw_messages(self) -> None:
         win = self._msg_win
@@ -224,8 +214,6 @@ class TUI:
     def set_status(self, text: str) -> None:
         self._draw_status(text)
         curses.doupdate()
-
-
 
     def read_password(self, prompt: str) -> str:
         saved_buf, saved_pos = self._input_buf, self._cursor_pos
@@ -385,8 +373,6 @@ class CLI:
             t._draw_input(self._prompt())
             curses.doupdate()
 
-
-
     def _prompt(self) -> str:
         return f"[{self._chat_name}] > " if self._chat_name else "pqc > "
 
@@ -406,12 +392,9 @@ class CLI:
             parts.append(f"чат: {self._chat_name}  (/back — выйти)")
         t.set_status("  │  ".join(parts))
 
-
-
     async def _dispatch(self, line: str) -> None:
         t = self._tui
         assert t
-
 
         if self._chat_id:
             cmd = line.lower()
@@ -424,7 +407,6 @@ class CLI:
             else:
                 await self._send_message(line)
             return
-
 
         if not line.startswith("/"):
             t.add_info("Используйте /chat <номер> для начала диалога")
@@ -452,8 +434,6 @@ class CLI:
             await handler(args)
         else:
             t.add_error(f"Неизвестная команда: {cmd}  (попробуйте /help)")
-
-
 
     async def _cmd_login(self, args: str) -> None:
         t = self._tui
@@ -641,8 +621,6 @@ class CLI:
     async def _cmd_quit(self, args: str) -> None:
         self._running = False
 
-
-
     async def _send_message(self, text: str) -> None:
         t = self._tui
         assert t
@@ -654,8 +632,6 @@ class CLI:
             t.add_sent(text, datetime.now().strftime("%H:%M"))
         except PQCError as e:
             t.add_error(str(e))
-
-
 
     def _on_message(self, contact_id: str, text: str) -> None:
         t = self._tui
@@ -703,7 +679,6 @@ def main() -> None:
         except Exception:
             pass
         sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
