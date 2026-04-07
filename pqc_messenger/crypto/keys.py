@@ -225,8 +225,13 @@ class KyberKeyPair:
         """
         Инкапсуляция: создать общий секрет и шифротекст для получателя.
 
-        При несовместимости режимов (реальный Kyber ↔ эмуляция)
-        выбрасывает HandshakeError — молчаливой деградации больше нет.
+        Режим (реальный Kyber или эмуляция X25519) определяется исключительно
+        по размеру публичного ключа получателя — это позволяет корректно работать
+        в смешанных сценариях (у нас liboqs есть, у пира — нет, или наоборот).
+
+        Совместимость:
+        - peer_public > 32 байт → реальный Kyber-768 (требует liboqs у нас)
+        - peer_public == 32 байт → эмуляция X25519 (работает всегда)
 
         Args:
             peer_public: Публичный ключ получателя.
@@ -235,18 +240,24 @@ class KyberKeyPair:
             (shared_secret, ciphertext) — общий секрет и шифротекст.
 
         Raises:
-            HandshakeError: Если режимы Kyber несовместимы.
+            HandshakeError: Если пир использует реальный Kyber, а у нас нет liboqs.
         """
         peer_is_real = self._is_real_kyber_data(peer_public)
 
-        if _HAS_LIBOQS and peer_is_real:
-            # Оба устройства поддерживают реальный Kyber
+        if peer_is_real:
+            # Пир использует настоящий ML-KEM — нам тоже нужен liboqs
+            if not _HAS_LIBOQS:
+                raise HandshakeError(
+                    "Пир использует реальный ML-KEM (Kyber-768), "
+                    "но liboqs недоступен на этом узле. "
+                    "Установите liboqs для подключения к этому контакту."
+                )
             kem = oqs.KeyEncapsulation("Kyber768")
             ciphertext, shared_secret = kem.encap_secret(peer_public)
             return shared_secret, ciphertext
-
-        if not peer_is_real and not _HAS_LIBOQS:
-            # Оба используют эмуляцию
+        else:
+            # Пир использует эмуляцию (32-байтный X25519 ключ).
+            # Используем эмуляцию независимо от того, есть ли у нас liboqs.
             ephemeral = X25519KeyPair.generate()
             peer_pub_key = X25519KeyPair.public_from_bytes(peer_public)
             raw_secret = ephemeral.shared_secret(peer_pub_key)
@@ -254,19 +265,25 @@ class KyberKeyPair:
                 raw_secret + b"kyber-768-emulation"
             ).digest()
             ciphertext = ephemeral.serialize_public()  # 32 bytes
+            if _HAS_LIBOQS:
+                logger.debug(
+                    "Пир использует X25519-эмуляцию Kyber — "
+                    "деградация до эмуляции для совместимости."
+                )
             return shared_secret, ciphertext
-
-        raise HandshakeError(
-            "Несовместимость Kyber-режимов: один пир использует реальный ML-KEM, "
-            "другой — X25519-эмуляцию. Handshake отклонён для сохранения "
-            "постквантовой защиты. Убедитесь, что оба пира установили liboqs."
-        )
 
     def decapsulate(self, ciphertext: bytes) -> bytes:
         """
         Декапсуляция: извлечь общий секрет из шифротекста.
 
-        При несовместимости режимов выбрасывает HandshakeError.
+        Режим определяется по размеру шифротекста, а не по флагу _is_real_kyber,
+        чтобы корректно обрабатывать контакты, чьи ключи менялись (например,
+        контакт установил liboqs после первого обмена ключами).
+
+        Совместимость:
+        - ciphertext > 32 байт → реальный Kyber-768 (требует liboqs и реальный ключ)
+        - ciphertext == 32 байт → эмуляция X25519 (работает всегда при наличии
+          приватного ключа нужного типа)
 
         Args:
             ciphertext: Полученный шифротекст от отправителя.
@@ -275,35 +292,50 @@ class KyberKeyPair:
             32 байта общего секрета.
 
         Raises:
-            HandshakeError: Если режимы Kyber несовместимы.
+            HandshakeError: Если шифротекст несовместим с нашим ключом.
         """
         if len(ciphertext) == 0:
             raise HandshakeError(
-                "Получен пустой Kyber-шифротекст: пир не поддерживает liboqs. "
-                "Handshake отклонён."
+                "Получен пустой Kyber-шифротекст. Handshake отклонён."
             )
 
         ct_is_real = self._is_real_kyber_data(ciphertext)
 
-        if self._is_real_kyber and ct_is_real and _HAS_LIBOQS:
-            # Реальный Kyber шифротекст + реальный ключ
+        if ct_is_real:
+            # Отправитель использует настоящий ML-KEM
+            if not _HAS_LIBOQS:
+                raise HandshakeError(
+                    "Получен реальный Kyber-шифротекст, "
+                    "но liboqs недоступен на этом узле."
+                )
+            if not self._is_real_kyber:
+                raise HandshakeError(
+                    "Получен реальный Kyber-шифротекст, "
+                    "но наш ключ был создан в режиме эмуляции. "
+                    "Сбросьте identity и зарегистрируйтесь заново."
+                )
             kem = oqs.KeyEncapsulation("Kyber768", self.private_key)
             return kem.decap_secret(ciphertext)
-
-        if not ct_is_real and not self._is_real_kyber:
-            # Оба используют эмуляцию: ciphertext = ephemeral X25519 pub
+        else:
+            # Отправитель использует эмуляцию (ciphertext = ephemeral X25519 pub).
+            # Декапсулируем через X25519 независимо от нашего режима.
+            if self._is_real_kyber:
+                # Наш приватный ключ — настоящий Kyber, но шифротекст — X25519.
+                # Такое возможно если контакт добавил нас до установки liboqs.
+                # Для совместимости пробуем использовать приватный ключ как X25519.
+                # Это корректно только если private_key был сохранён как X25519 (32 байта),
+                # что невозможно для настоящего Kyber (2400 байт). Бросаем ошибку.
+                raise HandshakeError(
+                    f"Получен X25519-эмуляция шифротекст ({len(ciphertext)} байт), "
+                    "но наш ключ — настоящий Kyber-768. "
+                    "Контакт должен обновить ваш публичный ключ в своей адресной книге."
+                )
             own_kp = X25519KeyPair.from_private_bytes(self.private_key)
             peer_ephemeral = X25519KeyPair.public_from_bytes(ciphertext)
             raw_secret = own_kp.shared_secret(peer_ephemeral)
             return hashlib.sha256(
                 raw_secret + b"kyber-768-emulation"
             ).digest()
-
-        raise HandshakeError(
-            f"Несовместимость Kyber-режимов при декапсуляции "
-            f"(ciphertext={len(ciphertext)} байт, own_real={self._is_real_kyber}). "
-            "Handshake отклонён."
-        )
 
 
 # ─── Identity Key Bundle ─────────────────────────────────────────────────────
