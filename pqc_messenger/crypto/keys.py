@@ -37,37 +37,90 @@ logger = get_logger("crypto.keys")
 
 _HAS_LIBOQS = False
 
-_PROJECT_LIB_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "lib",
+# ─── Определение пути к локальной liboqs ────────────────────────────────────
+# Корень проекта = на два уровня выше этого файла (pqc_messenger/crypto/keys.py)
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-if os.path.isdir(_PROJECT_LIB_DIR):
-    _current_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    if _PROJECT_LIB_DIR not in _current_ld:
-        os.environ["LD_LIBRARY_PATH"] = (
-            f"{_PROJECT_LIB_DIR}:{_current_ld}" if _current_ld else _PROJECT_LIB_DIR
-        )
-    import ctypes
-    import ctypes.util
-    _liboqs_path = os.path.join(_PROJECT_LIB_DIR, "liboqs.so")
-    if os.path.exists(_liboqs_path):
-        try:
-            ctypes.cdll.LoadLibrary(_liboqs_path)
-            logger.debug("liboqs.so загружена из %s", _liboqs_path)
-        except OSError as _e:
-            logger.warning("Не удалось загрузить liboqs.so: %s", _e)
+_PROJECT_LIB_DIR = os.path.join(_PROJECT_ROOT, "lib")
 
-try:
+def _ensure_liboqs_python() -> bool:
+    """
+    Убедиться, что пакет liboqs-python установлен.
+    Если нет — установить автоматически через pip.
+    Возвращает True, если пакет доступен после проверки/установки.
+    """
+    import importlib
     import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="liboqs version.*differs", category=UserWarning)
-        import oqs  # type: ignore[import-untyped]
-    _HAS_LIBOQS = True
-    logger.info("liboqs доступен — используется реальный ML-KEM (Kyber-768)")
-except ImportError:
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"liboqs version.*differs",
+                category=UserWarning,
+            )
+            importlib.import_module("oqs")
+        return True
+    except ImportError:
+        pass
+
+    import subprocess
+    import sys
+    logger.info("liboqs-python не найден. Автоматическая установка...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "liboqs-python", "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info("liboqs-python успешно установлен.")
+        return True
+    except subprocess.CalledProcessError as _e:
+        logger.warning("Не удалось установить liboqs-python: %s", _e)
+        return False
+
+
+# ─── Настройка OQS_INSTALL_PATH и загрузка liboqs из папки lib/ ─────────────
+_local_liboqs = os.path.join(_PROJECT_LIB_DIR, "liboqs.so")
+if os.path.exists(_local_liboqs):
+    # OQS_INSTALL_PATH — стандартный механизм oqs: ищет lib/liboqs.so внутри него.
+    # Указываем корень проекта, где уже лежит папка lib/ с liboqs.so.
+    os.environ.setdefault("OQS_INSTALL_PATH", _PROJECT_ROOT)
+    logger.debug(
+        "OQS_INSTALL_PATH задан: %s (liboqs.so найден в %s)",
+        _PROJECT_ROOT,
+        _PROJECT_LIB_DIR,
+    )
+else:
     logger.warning(
-        "liboqs не найден — Kyber-768 эмулируется через X25519 + HKDF. "
-        "Для полной постквантовой защиты установите liboqs-python."
+        "liboqs.so не найден в %s — будет использована системная библиотека (если есть).",
+        _PROJECT_LIB_DIR,
+    )
+
+# ─── Автоустановка liboqs-python и импорт oqs ───────────────────────────────
+if _ensure_liboqs_python():
+    try:
+        import warnings
+        # Подавляем предупреждение о несовпадении версий liboqs / liboqs-python.
+        # lib/liboqs.so.0.15.0 новее пакета 0.14.x, но API совместим.
+        warnings.filterwarnings(
+            "ignore",
+            message=r"liboqs version.*differs",
+            category=UserWarning,
+        )
+        import oqs  # type: ignore[import-untyped]
+        _HAS_LIBOQS = True
+        logger.info("liboqs доступен — используется реальный ML-KEM (Kyber-768)")
+    except (ImportError, RuntimeError) as _oqs_err:
+        logger.warning(
+            "Не удалось инициализировать oqs (%s) — "
+            "Kyber-768 эмулируется через X25519 + HKDF.",
+            _oqs_err,
+        )
+else:
+    logger.warning(
+        "liboqs-python недоступен — Kyber-768 эмулируется через X25519 + HKDF. "
+        "Для полной постквантовой защиты убедитесь в наличии pip и интернета."
     )
 
 

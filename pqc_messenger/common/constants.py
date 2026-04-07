@@ -4,8 +4,6 @@
 Централизованное хранение всех параметров криптографии, сети и приложения.
 """
 
-
-
 KEM_ALGORITHM = "Kyber768"
 
 AES_KEY_SIZE   = 32   # 256 бит
@@ -20,7 +18,7 @@ HKDF_INFO_KEM_COMBINE = b"pqc-messenger-kem-combine-v1"
 
 
 ARGON2_TIME_COST   = 3
-ARGON2_MEMORY_COST = 65536   # 64 MiB
+ARGON2_MEMORY_COST = 65536
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN    = 32
 ARGON2_SALT_LEN    = 16
@@ -54,7 +52,7 @@ RECONNECT_DELAY_MAX = 60   # сек — максимальная задержк�
 RECONNECT_ATTEMPTS  = 0    # 0 = бесконечно
 
 
-RATE_LIMIT_WINDOW   = 60   # секунд
+RATE_LIMIT_WINDOW   = 60
 RATE_LIMIT_MAX_MSGS = 120  # сообщений в окне на одного клиента
 
 
