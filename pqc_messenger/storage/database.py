@@ -318,10 +318,15 @@ class Database:
 
 
     def wipe_all(self) -> None:
-        conn = self._ensure_connection()
-        conn.execute("DELETE FROM sessions")
-        conn.execute("DELETE FROM messages")
-        conn.execute("DELETE FROM contacts")
-        conn.execute("VACUUM")
-        conn.commit()
-        logger.warning("Все данные БД удалены (WIPE)")
+        """
+        Полное удаление всех данных и самого файла базы данных.
+        """
+        self.close()
+        for suffix in ["", "-wal", "-shm"]:
+            path = self._db_path + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.error("Не удалось удалить файл %s: %s", path, e)
+        logger.warning("База данных полностью уничтожена (WIPE)")

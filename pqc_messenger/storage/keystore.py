@@ -171,12 +171,19 @@ class KeyStore:
 
 
     def wipe(self) -> None:
-        if self._conn:
-            self._conn.execute("DELETE FROM keystore")
-            self._conn.execute("VACUUM")
-            self._conn.commit()
+        """
+        Полное удаление всех ключей и самого файла хранилища.
+        """
+        self.close()
+        for suffix in ["", "-wal", "-shm"]:
+            path = self._ks_path + suffix
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.error("Не удалось удалить файл %s: %s", path, e)
         self.__master_key = None
-        logger.warning("Все ключи удалены (WIPE)")
+        logger.warning("Хранилище ключей полностью уничтожено (WIPE)")
 
     def close(self) -> None:
         """

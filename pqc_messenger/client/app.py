@@ -555,6 +555,9 @@ class PQCMessengerApp:
     # ── Очистка ───────────────────────────────────────────────────────────────
 
     async def wipe_all(self) -> None:
+        """
+        Полное уничтожение всех данных приложения.
+        """
         for session in self._sessions.values():
             session.destroy()
         self._sessions.clear()
@@ -563,6 +566,15 @@ class PQCMessengerApp:
         self._db.wipe_all()
         self._keystore.wipe()
         self._identity = None
+
+        # Попытка удалить директорию данных, если она пуста
+        if os.path.exists(self._data_dir) and not os.listdir(self._data_dir):
+            try:
+                os.rmdir(self._data_dir)
+                logger.info("Директория данных удалена: %s", self._data_dir)
+            except Exception as e:
+                logger.error("Не удалось удалить директорию данных: %s", e)
+
         logger.warning("Все данные полностью уничтожены (WIPE)")
 
     def shutdown(self) -> None:
