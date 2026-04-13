@@ -80,16 +80,34 @@ def _ensure_liboqs_python() -> bool:
         return False
 
 
-# ─── Настройка OQS_INSTALL_PATH и загрузка liboqs из папки lib/ ─────────────
+# ─── Настройка путей к liboqs ДО любого импорта oqs ────────────────────────
+# ВАЖНО: OQS_INSTALL_PATH и LD_LIBRARY_PATH должны быть выставлены до первого
+# импорта пакета oqs, потому что oqs.py вызывает _load_liboqs() на уровне
+# модуля при импорте. Кэш sys.modules гарантирует, что повторный импорт
+# не перезапускает _load_liboqs() — поэтому первый импорт должен уже видеть
+# правильные переменные окружения.
 _local_liboqs = os.path.join(_PROJECT_LIB_DIR, "liboqs.so")
 if os.path.exists(_local_liboqs):
-    # OQS_INSTALL_PATH — стандартный механизм oqs: ищет lib/liboqs.so внутри него.
-    # Указываем корень проекта, где уже лежит папка lib/ с liboqs.so.
+    # OQS_INSTALL_PATH — стандартный механизм oqs: ищет OQS_INSTALL_PATH/lib/liboqs.so.
+    # Используем setdefault чтобы не перезаписывать явно заданный пользователем путь.
     os.environ.setdefault("OQS_INSTALL_PATH", _PROJECT_ROOT)
+
+    # LD_LIBRARY_PATH нужен по двум причинам:
+    # 1. ctypes.util.find_library() использует ldconfig/ldd — без записи в
+    #    LD_LIBRARY_PATH или ldcache системная утилита не найдёт нашу liboqs.so.
+    # 2. liboqs.so сама может динамически подгружать зависимости (libssl и др.)
+    #    из той же папки — без LD_LIBRARY_PATH dlopen не найдёт их.
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    lib_dir_abs = os.path.abspath(_PROJECT_LIB_DIR)
+    if lib_dir_abs not in ld_path.split(os.pathsep):
+        os.environ["LD_LIBRARY_PATH"] = (
+            lib_dir_abs + (os.pathsep + ld_path if ld_path else "")
+        )
+
     logger.debug(
-        "OQS_INSTALL_PATH задан: %s (liboqs.so найден в %s)",
+        "OQS_INSTALL_PATH=%s, LD_LIBRARY_PATH включает %s",
         _PROJECT_ROOT,
-        _PROJECT_LIB_DIR,
+        lib_dir_abs,
     )
 else:
     logger.warning(
@@ -111,11 +129,15 @@ if _ensure_liboqs_python():
         import oqs  # type: ignore[import-untyped]
         _HAS_LIBOQS = True
         logger.info("liboqs доступен — используется реальный ML-KEM (Kyber-768)")
-    except (ImportError, RuntimeError) as _oqs_err:
+    except (ImportError, RuntimeError, SystemExit) as _oqs_err:
         logger.warning(
-            "Не удалось инициализировать oqs (%s) — "
-            "Kyber-768 эмулируется через X25519 + HKDF.",
+            "Не удалось инициализировать oqs (%s: %s) — "
+            "Kyber-768 эмулируется через X25519 + HKDF. "
+            "Проверьте: OQS_INSTALL_PATH=%s, LD_LIBRARY_PATH=%s",
+            type(_oqs_err).__name__,
             _oqs_err,
+            os.environ.get("OQS_INSTALL_PATH", "<не задан>"),
+            os.environ.get("LD_LIBRARY_PATH", "<не задан>"),
         )
 else:
     logger.warning(

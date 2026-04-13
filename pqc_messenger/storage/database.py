@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     display_name TEXT DEFAULT '',
     x25519_public_key BLOB NOT NULL,
     kyber_public_key BLOB NOT NULL,
+    kyber_mode INTEGER NOT NULL DEFAULT 0,
     added_at REAL DEFAULT (strftime('%s', 'now'))
 );
 
@@ -61,6 +62,8 @@ class Contact:
     display_name: str
     x25519_public_key: bytes
     kyber_public_key: bytes
+    # 1 = реальный ML-KEM/Kyber-768, 0 = X25519-эмуляция
+    kyber_mode: int
     added_at: float
 
 
@@ -89,6 +92,11 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
             self._conn.commit()
+
+            # Запускаем миграции после создания/открытия схемы
+            from pqc_messenger.storage.migrations import run_migrations
+            run_migrations(self._conn)
+
             logger.info("База данных инициализирована: %s", self._db_path)
         except sqlite3.Error as e:
             raise DatabaseError(f"Ошибка инициализации БД: {e}") from e
@@ -103,21 +111,21 @@ class Database:
             raise DatabaseError("База данных не инициализирована")
         return self._conn
 
-
-
     def add_contact(
         self,
         contact_id: str,
         x25519_pub: bytes,
         kyber_pub: bytes,
         display_name: str = "",
+        kyber_mode: int = 0,
     ) -> Contact:
         conn = self._ensure_connection()
         try:
             conn.execute(
-                "INSERT INTO contacts (id, display_name, x25519_public_key, kyber_public_key) "
-                "VALUES (?, ?, ?, ?)",
-                (contact_id, display_name, x25519_pub, kyber_pub),
+                "INSERT INTO contacts "
+                "(id, display_name, x25519_public_key, kyber_public_key, kyber_mode) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (contact_id, display_name, x25519_pub, kyber_pub, kyber_mode),
             )
             conn.commit()
             logger.info("Контакт добавлен: %s...", contact_id[:16])
@@ -126,6 +134,7 @@ class Database:
                 display_name=display_name,
                 x25519_public_key=x25519_pub,
                 kyber_public_key=kyber_pub,
+                kyber_mode=kyber_mode,
                 added_at=time.time(),
             )
         except sqlite3.IntegrityError:
@@ -136,7 +145,8 @@ class Database:
     def get_contact(self, contact_id: str) -> Contact | None:
         conn = self._ensure_connection()
         row = conn.execute(
-            "SELECT id, display_name, x25519_public_key, kyber_public_key, added_at "
+            "SELECT id, display_name, x25519_public_key, kyber_public_key, "
+            "kyber_mode, added_at "
             "FROM contacts WHERE id = ?",
             (contact_id,),
         ).fetchone()
@@ -145,7 +155,8 @@ class Database:
     def get_all_contacts(self) -> list[Contact]:
         conn = self._ensure_connection()
         rows = conn.execute(
-            "SELECT id, display_name, x25519_public_key, kyber_public_key, added_at "
+            "SELECT id, display_name, x25519_public_key, kyber_public_key, "
+            "kyber_mode, added_at "
             "FROM contacts ORDER BY added_at DESC"
         ).fetchall()
         return [Contact(*row) for row in rows]
@@ -156,112 +167,54 @@ class Database:
         conn.commit()
         logger.info("Контакт удалён: %s...", contact_id[:16])
 
-
+    def get_messages(self, contact_id: str, limit: int = 100) -> list[tuple]:
+        conn = self._ensure_connection()
+        rows = conn.execute(
+            "SELECT id, direction, encrypted_content, timestamp "
+            "FROM messages WHERE contact_id = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (contact_id, limit),
+        ).fetchall()
+        return rows
 
     def store_message(
         self,
         contact_id: str,
         direction: str,
         encrypted_content: bytes,
-    ) -> int:
+    ) -> None:
         conn = self._ensure_connection()
-        try:
-            cursor = conn.execute(
-                "INSERT INTO messages (contact_id, direction, encrypted_content) "
-                "VALUES (?, ?, ?)",
-                (contact_id, direction, encrypted_content),
-            )
-            conn.commit()
-            msg_id = cursor.lastrowid or 0
-
-            self._prune_messages_if_needed(contact_id)
-
-            return msg_id
-        except sqlite3.Error as e:
-            raise DatabaseError(f"Ошибка сохранения сообщения: {e}") from e
-
-    def _prune_messages_if_needed(self, contact_id: str) -> None:
-        """
-        Удалить старые сообщения если превышен лимит.
-
-        Проверяем два лимита:
-        - DB_MAX_MESSAGES_PER_CONTACT
-        - DB_MAX_TOTAL_MESSAGES
-        """
-        conn = self._ensure_connection()
-
-
-        (count_contact,) = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE contact_id = ?",
-            (contact_id,),
-        ).fetchone()
-
-        if count_contact > DB_MAX_MESSAGES_PER_CONTACT:
-            to_delete = count_contact - DB_PRUNE_KEEP
-            conn.execute(
-                "DELETE FROM messages WHERE contact_id = ? AND id IN ("
-                "  SELECT id FROM messages WHERE contact_id = ? "
-                "  ORDER BY timestamp ASC LIMIT ?"
-                ")",
-                (contact_id, contact_id, to_delete),
-            )
-            conn.commit()
-            logger.info(
-                "Очистка БД: удалено %d старых сообщений для %s...",
-                to_delete, contact_id[:16],
-            )
-
-
-        (count_total,) = conn.execute(
-            "SELECT COUNT(*) FROM messages"
-        ).fetchone()
-
-        if count_total > DB_MAX_TOTAL_MESSAGES:
-            to_delete = count_total - DB_PRUNE_KEEP
-            conn.execute(
-                "DELETE FROM messages WHERE id IN ("
-                "  SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?"
-                ")",
-                (to_delete,),
-            )
-            conn.commit()
-            logger.info("Очистка БД: удалено %d старых сообщений (суммарный лимит)", to_delete)
-
-    def get_messages(
-        self,
-        contact_id: str,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[tuple[int, str, bytes, float]]:
-        conn = self._ensure_connection()
-        rows = conn.execute(
-            "SELECT id, direction, encrypted_content, timestamp "
-            "FROM messages WHERE contact_id = ? "
-            "ORDER BY timestamp ASC LIMIT ? OFFSET ?",
-            (contact_id, limit, offset),
-        ).fetchall()
-        return rows
-
-    def count_messages(self, contact_id: str | None = None) -> int:
-        """Получить количество сообщений (для контакта или всего)."""
-        conn = self._ensure_connection()
-        if contact_id:
-            (n,) = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE contact_id = ?", (contact_id,)
-            ).fetchone()
-        else:
-            (n,) = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
-        return n
-
-    def delete_messages(self, contact_id: str) -> int:
-        conn = self._ensure_connection()
-        cursor = conn.execute(
-            "DELETE FROM messages WHERE contact_id = ?", (contact_id,)
+        conn.execute(
+            "INSERT INTO messages (contact_id, direction, encrypted_content) "
+            "VALUES (?, ?, ?)",
+            (contact_id, direction, encrypted_content),
         )
         conn.commit()
-        return cursor.rowcount
+        self._prune_messages(conn, contact_id)
 
+    def _prune_messages(self, conn: sqlite3.Connection, contact_id: str) -> None:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE contact_id = ?", (contact_id,)
+        ).fetchone()[0]
+        if count > DB_MAX_MESSAGES_PER_CONTACT:
+            conn.execute(
+                "DELETE FROM messages WHERE contact_id = ? AND id NOT IN ("
+                "  SELECT id FROM messages WHERE contact_id = ? "
+                "  ORDER BY timestamp DESC LIMIT ?"
+                ")",
+                (contact_id, contact_id, DB_PRUNE_KEEP),
+            )
+            conn.commit()
 
+        total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        if total > DB_MAX_TOTAL_MESSAGES:
+            conn.execute(
+                "DELETE FROM messages WHERE id NOT IN ("
+                "  SELECT id FROM messages ORDER BY timestamp DESC LIMIT ?"
+                ")",
+                (DB_MAX_TOTAL_MESSAGES,),
+            )
+            conn.commit()
 
     def store_session(
         self,
@@ -271,62 +224,32 @@ class Database:
     ) -> None:
         conn = self._ensure_connection()
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, contact_id, ratchet_state, last_activity) "
-            "VALUES (?, ?, ?, ?)",
-            (session_id, contact_id, ratchet_state, time.time()),
+            "INSERT OR REPLACE INTO sessions "
+            "(id, contact_id, ratchet_state, last_activity) "
+            "VALUES (?, ?, ?, strftime('%s', 'now'))",
+            (session_id, contact_id, ratchet_state),
         )
         conn.commit()
 
-    def get_session(self, contact_id: str) -> tuple[str, bytes] | None:
+    def get_all_sessions(self) -> list[tuple]:
         conn = self._ensure_connection()
-        row = conn.execute(
-            "SELECT id, ratchet_state FROM sessions WHERE contact_id = ? "
-            "ORDER BY last_activity DESC LIMIT 1",
-            (contact_id,),
-        ).fetchone()
-        return row
-
-    def get_all_sessions(self) -> list[tuple[str, str, bytes, float]]:
-        """Получить все сессии: (session_id, contact_id, ratchet_state, last_activity)."""
-        conn = self._ensure_connection()
-        rows = conn.execute(
+        return conn.execute(
             "SELECT id, contact_id, ratchet_state, last_activity FROM sessions"
         ).fetchall()
-        return rows
-
-    def delete_session(self, session_id: str) -> None:
-        conn = self._ensure_connection()
-        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-        conn.commit()
 
     def delete_expired_sessions(self, ttl: float) -> int:
-        """
-        Удалить сессии старше ttl секунд.
-        Возвращает количество удалённых записей.
-        """
-        conn  = self._ensure_connection()
+        conn = self._ensure_connection()
         cutoff = time.time() - ttl
-        cursor = conn.execute(
+        cur = conn.execute(
             "DELETE FROM sessions WHERE last_activity < ?", (cutoff,)
         )
         conn.commit()
-        n = cursor.rowcount
-        if n:
-            logger.info("Удалено %d истёкших сессий", n)
-        return n
-
-
+        return cur.rowcount
 
     def wipe_all(self) -> None:
-        """
-        Полное удаление всех данных и самого файла базы данных.
-        """
-        self.close()
-        for suffix in ["", "-wal", "-shm"]:
-            path = self._db_path + suffix
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    logger.error("Не удалось удалить файл %s: %s", path, e)
-        logger.warning("База данных полностью уничтожена (WIPE)")
+        conn = self._ensure_connection()
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM contacts")
+        conn.commit()
+        logger.warning("Все данные удалены из БД (WIPE)")

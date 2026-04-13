@@ -222,12 +222,55 @@ class PQCMessengerApp:
     ) -> Contact:
         x25519_pub = bytes.fromhex(x25519_pub_hex)
         kyber_pub  = bytes.fromhex(kyber_pub_hex)
+
+        # Определяем режим Kyber по размеру публичного ключа.
+        # 1184 байт → реальный ML-KEM/Kyber-768
+        # 32 байт   → X25519-эмуляция
+        # Иное      → некорректный ключ, сообщаем пользователю.
+        contact_kyber_real = Identity.kyber_is_real(kyber_pub)
+        kyber_mode = 1 if contact_kyber_real else 0
+
+        n = len(kyber_pub)
+        if n not in (1184, 32):
+            raise ValueError(
+                f"Неверный размер kyber_pub: {n} байт "
+                f"(ожидается 2368 hex-символов для ML-KEM или 64 для эмуляции). "
+                f"Убедитесь, что ключ скопирован полностью."
+            )
+
+        # Предупреждение о несовместимости KEM-режимов.
+        # При смешанном режиме (один узел с liboqs, другой без) handshake
+        # всё равно пройдёт — encapsulate() деградирует до эмуляции
+        # если пир использует 32-байтный ключ, — но постквантовой защиты нет.
+        our_kyber_real = bool(_HAS_LIBOQS)
+        if our_kyber_real and not contact_kyber_real:
+            warn = (
+                f"ВНИМАНИЕ: контакт {(display_name or kyber_pub_hex[:16])!r} "
+                "использует X25519-эмуляцию Kyber (liboqs не установлен). "
+                "Handshake будет выполнен в режиме эмуляции — "
+                "постквантовая защита НЕ активна для этого соединения."
+            )
+            logger.warning(warn)
+            if self._message_callback:
+                self._message_callback("system", "⚠ " + warn)
+        elif not our_kyber_real and contact_kyber_real:
+            warn = (
+                f"ВНИМАНИЕ: контакт {(display_name or kyber_pub_hex[:16])!r} "
+                "использует реальный ML-KEM/Kyber-768, но на этом устройстве "
+                "liboqs не установлен. Установите liboqs для полной совместимости. "
+                "Входящие handshake от этого контакта будут отклонены."
+            )
+            logger.warning(warn)
+            if self._message_callback:
+                self._message_callback("system", "⚠ " + warn)
+
         contact_id = Identity.compute_id(x25519_pub, kyber_pub)
         return self._db.add_contact(
             contact_id=contact_id,
             x25519_pub=x25519_pub,
             kyber_pub=kyber_pub,
             display_name=display_name,
+            kyber_mode=kyber_mode,
         )
 
     def delete_contact(self, contact_id: str) -> None:
