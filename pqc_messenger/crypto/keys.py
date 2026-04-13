@@ -389,10 +389,19 @@ class IdentityKeyBundle:
         """
         Вычислить отпечаток (fingerprint) идентичности.
 
-        Формула: SHA-256(x25519_pub || kyber_pub), представленный как hex.
+        Использует ту же формулу что и Identity.compute_id:
+        SHA-256(x25519_pub || mode_byte || kyber_pub)
+
+        mode_byte нормализует хэш так, что fingerprint не зависит от наличия
+        liboqs на вычисляющем узле — только от реального размера kyber_pub.
+        Это гарантирует совпадение fingerprint пользователя с identity_hash
+        на relay и в адресных книгах контактов.
         """
-        combined = self.x25519.serialize_public() + self.kyber.public_key
-        return hashlib.sha256(combined).hexdigest()
+        from pqc_messenger.crypto.identity import Identity
+        return Identity.compute_id(
+            self.x25519.serialize_public(),
+            self.kyber.public_key,
+        )
 
     def public_bundle(self) -> dict[str, bytes]:
         """Получить только публичные ключи для передачи собеседнику."""
