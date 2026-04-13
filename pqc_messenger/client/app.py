@@ -417,9 +417,11 @@ class PQCMessengerApp:
         from pqc_messenger.protocol.handshake import HandshakeInitMessage
         try:
             init_msg = HandshakeInitMessage.deserialize(packet.payload)
+            trusted_ids = {c.id for c in self._db.get_all_contacts()}
             resp_msg, shared_secret = Handshake.process_init(
                 responder=self._identity,  # type: ignore[arg-type]
                 init_msg=init_msg,
+                trusted_contact_ids=trusted_ids,
             )
             contact_id = Identity.compute_id(
                 init_msg.initiator_x25519_pub,
