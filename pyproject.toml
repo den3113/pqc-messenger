@@ -24,6 +24,9 @@ dev = [
 pqc-server = "pqc_messenger.network.relay_server:main"
 pqc-client = "pqc_messenger.client.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["pqc_messenger*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
